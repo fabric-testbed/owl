@@ -1,0 +1,5 @@
+**__pycache__**
+*.pcap
+*.csv
+owl-venv/
+***local*
