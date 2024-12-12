@@ -18,7 +18,7 @@ RUN pip install requests
 RUN pip install influxdb3-python
 RUN pip install pandas
 
-RUN git clone https://github.com/fabric-testbed/owl.git
+RUN git clone -b dev https://github.com/fabric-testbed/owl.git
 RUN mkdir /owl_output
 RUN mkdir /owl_config
 RUN gcc -fPIC -shared -o /owl/owl/sock_ops/ptp_time.so \
