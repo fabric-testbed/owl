@@ -1,12 +1,12 @@
 certifi==2025.4.26
 charset-normalizer==3.4.2
-idna==3.10
+idna==3.19
 influxdb-client==1.48.0
 influxdb3-python==0.12.0
 numpy==2.2.5
 pandas==2.2.3
 psutil==7.0.0
-pyarrow==20.0.0
+pyarrow==25.0.1
 python-dateutil==2.9.0.post0
 pytz==2025.2
 reactivex==4.0.4
