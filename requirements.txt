@@ -1,4 +1,4 @@
-certifi==2025.4.26
+certifi==2026.10.19
 charset-normalizer==3.4.2
 idna==3.19
 influxdb-client==1.48.0
@@ -15,4 +15,4 @@ scapy==2.7.0
 six==1.17.0
 typing_extensions==4.13.2
 tzdata==2025.2
-urllib3==2.7.0
+urllib3==2.8.0
