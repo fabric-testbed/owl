@@ -39,6 +39,7 @@ owl/
 ├── cli.py       # argparse: `owl ping`, `owl reflect`
 └── __main__.py  # python -m owl
 tests/           # unittest: test_packets.py (portable), test_loopback.py (Linux)
+dev/             # FABRIC validation notebooks (not part of the package), e.g. the two-node hw test
 ```
 
 ### Key design points

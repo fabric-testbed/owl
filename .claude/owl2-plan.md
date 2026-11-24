@@ -199,7 +199,7 @@ What to check, on two VMs at different PTP sites:
 - [x] `packets.py`: versioned probe/report pack and unpack, the `SCM_TIMESTAMPING` / `sock_extended_err` parsers (offline unit tests) (2026-11-24)
 - [x] `sockets.py`: v4/v6 `TimestampedSocket` with OPT_ID TX tokens, `SIOCSHWTSTAMP`, interface lookup via `ip -j addr` (2026-11-24)
 - [x] `owl ping` (per-probe output, summary, `--json`) and `owl reflect`. Loopback tests pass with software timestamps on Linux, Python 3.9, IPv4 and IPv6 (2026-11-24)
-- [ ] Two-node hardware test on FABRIC, over FABNetv4 and FABNetv6. **Run this before Phase 2.** It also settles the clock-domain question in "Phase 1 implementation notes" below.
+- [ ] Two-node hardware test on FABRIC, over FABNetv4 and FABNetv6. **Run this before Phase 2.** It also settles the clock-domain question in "Phase 1 implementation notes" below. Notebook: `dev/fabric_two_node_test.ipynb` (2026-11-24): measures system−PHC offset and drift for `ptp_kvm` and each NIC PHC, runs both directions × v4/v6 × hw/sw, prints a verdict and saves a JSON file.
 
 ### Phase 2: owl daemon (this repo)
 - [ ] JSON config with labels; the daemon event loop; counters
