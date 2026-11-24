@@ -1,7 +1,7 @@
 # owl2 — Architecture & Implementation Plan
 
 **Created:** 2026-11-24
-**Last updated:** 2026-11-24
+**Last updated:** 2026-11-24 (FABRIC two-node test results)
 
 This document supersedes `.claude/owl-redesign-plan.md` (2026-04) as the top-level plan. That file is still the detailed reference for the measurement core (socket setup, event loop, `MSG_ERRQUEUE` handling, hardware-timestamp filter). owl2 keeps that core and changes everything around it. Where the two conflict, this file wins.
 
@@ -101,7 +101,7 @@ Changes from 2026-04:
   - `stdout` / `jsonl` file, the default.
   - `http-lineprotocol`: batched POST via `urllib` to any line-protocol endpoint (InfluxDB v2/v3, Telegraf, VictoriaMetrics). It keeps a bounded in-memory retry buffer. If the endpoint is down, measurement continues; on overflow the oldest points are dropped and counted.
   - **Summaries:** every `summary_sec` (default 60), emit a per-peer summary (count, lost, min, p50, mean, max, stddev) alongside the raw samples. Raw and summary samples can be routed to different buckets or measurements.
-- **Clock-health guard:** each round, check that the PHC is locked, e.g. with the `PTP_SYS_OFFSET` ioctl on `/dev/ptpN` comparing PHC to `CLOCK_REALTIME`. Mark samples `ptp_ok=false` rather than dropping them.
+- **Clock-health guard:** each round, compare the dataplane NIC's PHC with `CLOCK_REALTIME`, using the tightest of N `clock_gettime` triples on the `/dev/ptpN` fd, or the `PTP_SYS_OFFSET` ioctl. Mark samples `ptp_ok=false` rather than dropping them. The FABRIC test (2026-11-24) showed this is essential: without `phc2sys@<iface>` the PHC drifts by ppm and is off by hundreds of ms.
 - **Counters:** probes sent, TX-timestamp failures, zero RX timestamps, reaped and sink drops, logged each round to journald.
 
 ## Repo 2: FABRIC latency service (`latency-dashboard`, possibly renamed `fabric-latency`)
@@ -177,15 +177,42 @@ Decisions made while building, which refine the design above:
   - Hardware timestamps are in the NIC PHC's timebase, often TAI, about 37 s ahead of UTC. Never mix the two kinds.
 - **The April plan's `SOF_TIMESTAMPING_*` bit values were wrong** (TX_HARDWARE is `1<<0`, not `1<<2`). `owl/sockets.py` has the correct values from `linux/net_tstamp.h`.
 
-**Open risk the FABRIC hardware test must answer:** FABRIC VMs get time from the host through `ptp_kvm`, and `phc2sys` disciplines the VM's `CLOCK_REALTIME`. It is not known whether the VM's dataplane NIC hardware clock (a ConnectX VF) is itself disciplined to the grandmaster.
-- If it is not, hardware timestamps from different sites are not comparable, and `--clock sw` (kernel timestamps on the PTP-synced system clock, µs-level) becomes the default for FABRIC.
-- A later option is to translate hardware timestamps into system time with `PTP_SYS_OFFSET`.
+### FABRIC two-node hardware test results (2026-11-24)
 
-What to check, on two VMs at different PTP sites:
-1. `ethtool -T <dataplane iface>` on both.
-2. `owl ping --clock hw` vs `--clock sw` between them: compare `owl` against `rtt/2`, and check that `owl` doesn't jump by about 37 s or drift.
-3. Both directions (A→B and B→A).
-4. Repeat over FABNetv6.
+Run with `dev/fabric_two_node_test.ipynb`.
+- **Setup:** UCSD ↔ TOKY, `default_ubuntu_22` (kernel 5.15.0-185), dataplane NICs are ConnectX VFs (`mlx5_core`, fw 20.43), owl at `ae80b6f`.
+- **Earlier open risk:** whether a VF's NIC hardware clock (PHC) is disciplined at all. Answer: only if the PTP playbook's `phc2sys` services run.
+
+**Clocks.**
+- **Before PTP was set up correctly,** each NIC's PHC was free-running: 0.3–0.7 s off the host clock, drifting 1.7–5.8 ppm. Raw `--clock hw` across sites would have been meaningless.
+- **The `fabric-testbed/ptp` playbook does sync it.** Besides `phc2sys@CLOCK_REALTIME`, it starts `phc2sys@<iface>` for every interface with a PHC. That service steers the NIC's PHC from `ptp_kvm` with `-O +0`, so the PHC runs on UTC, not TAI. A VF *is* allowed to adjust its PHC.
+- **Measured with those services running:** system clock vs `ptp_kvm` within 0.4–0.5 µs, and NIC PHC vs system clock within 0.4–0.65 µs. Drift is under 0.06 ppm.
+- **One clock per card:** both VFs on a VM (`/dev/ptp0`, `/dev/ptp1`) read identically, so they are probably one card clock steered by two `phc2sys` instances. That caused no visible problem. If hw results ever look noisier than expected, run one `phc2sys` per physical clock.
+
+**`owl ping --clock hw`: works.** 50/50 probes in every run.
+
+| | UCSD→TOKY min | TOKY→UCSD min | rtt min | rtt − sum |
+|---|---|---|---|---|
+| IPv4 | 54.331 ms | 62.498 ms | 116.898 ms | 69 µs |
+| IPv6 | 62.499 ms | 62.500 ms | 125.077 ms | 78 µs |
+
+- **Clock agreement:** over IPv6 the two directions differ by 0.2 µs, which bounds the clock offset between the VMs.
+- **Reflector turnaround:** `rtt − sum`, 69–78 µs. It does not affect `owl`.
+- **IPv4 routing is asymmetric:** the two directions differ by 8.2 ms. That is real (the clocks are proven consistent), and it is exactly what RTT/2 hides.
+- **Jitter:** average − min is 13–37 µs.
+
+**`--clock sw`: broken on these VMs.**
+- `mlx5_core` on 5.15 produces no software TX timestamps; `ethtool -T` lists only `hardware-*` capabilities. Loopback works on the same VM, and running as root makes no difference.
+- Every sw run is `no_tx_ts`.
+- To check: whether `SOF_TIMESTAMPING_TX_SCHED`, taken by the kernel when the packet is queued and independent of the driver, works there. If so, sw mode can fall back to it.
+
+**Consequences for later phases:**
+- **`--clock hw` stays the default and is the FABRIC mode.** Its timebase there is UTC.
+- **Clock-health guard (Phase 2):** compare each dataplane NIC's PHC with `CLOCK_REALTIME`, the method the notebook uses, which should agree within a few µs. Mark samples `ptp_ok=false` otherwise. Losing `phc2sys@<iface>` silently corrupts hw data, and that was the first failure seen here.
+- **Slice manager (Phase 3):** must verify that `phc2sys@CLOCK_REALTIME` *and* `phc2sys@<dataplane iface>` are active.
+- **Don't install Ubuntu's `linuxptp` package before the playbook.** The playbook then skips installing gcc/make, its linuxptp 4.4 build fails, and no `phc2sys` units are created.
+- **FABlib pitfall:** `node.execute(timeout=N)` runs `sudo timeout N <cmd>`, which breaks commands that start with a shell builtin such as `cd`.
+- **Image:** `default_ubuntu_22` works with the playbook. This partly settles the image question in "Still open".
 
 ## Implementation checklist
 
@@ -199,7 +226,8 @@ What to check, on two VMs at different PTP sites:
 - [x] `packets.py`: versioned probe/report pack and unpack, the `SCM_TIMESTAMPING` / `sock_extended_err` parsers (offline unit tests) (2026-11-24)
 - [x] `sockets.py`: v4/v6 `TimestampedSocket` with OPT_ID TX tokens, `SIOCSHWTSTAMP`, interface lookup via `ip -j addr` (2026-11-24)
 - [x] `owl ping` (per-probe output, summary, `--json`) and `owl reflect`. Loopback tests pass with software timestamps on Linux, Python 3.9, IPv4 and IPv6 (2026-11-24)
-- [ ] Two-node hardware test on FABRIC, over FABNetv4 and FABNetv6. **Run this before Phase 2.** It also settles the clock-domain question in "Phase 1 implementation notes" below. Notebook: `dev/fabric_two_node_test.ipynb` (2026-11-24): measures system−PHC offset and drift for `ptp_kvm` and each NIC PHC, runs both directions × v4/v6 × hw/sw, prints a verdict and saves a JSON file.
+- [x] Two-node hardware test on FABRIC, over FABNetv4 and FABNetv6. Notebook: `dev/fabric_two_node_test.ipynb`. **hw passes; sw has no TX timestamps on mlx5 VFs.** See "FABRIC two-node hardware test results" (2026-11-24).
+- [ ] `--clock sw` on drivers without software TX timestamps: fall back to `SOF_TIMESTAMPING_TX_SCHED` if the diagnostic shows it works on FABRIC. Otherwise print a clear error after the first `no_tx_ts` instead of 50 of them.
 
 ### Phase 2: owl daemon (this repo)
 - [ ] JSON config with labels; the daemon event loop; counters
