@@ -6,83 +6,48 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This project is being rewritten as **owl2** (v2.0, developed on the `owl2` branch; the last v1 commit is tagged `v1-final`). The architecture, decisions, and step-by-step implementation checklist are in **`.claude/owl2-plan.md`** — read that first before making any changes. The checklist at the bottom of that file tracks which steps are done and what comes next.
 
-`.claude/owl-redesign-plan.md` (2026-04) is superseded as the top-level plan but remains the detailed reference for the measurement core (`SO_TIMESTAMPING` socket setup, event loop, `MSG_ERRQUEUE` handling). Where the two conflict, `owl2-plan.md` wins.
-
-The sections below describe the **v1** code still in the tree; it will be deleted in owl2 Phase 1.
+`.claude/owl-redesign-plan.md` (2026-04) is superseded as the top-level plan but remains background on the measurement core. Where the two conflict, `owl2-plan.md` and the code win (its `SOF_TIMESTAMPING_*` bit values are wrong; use `owl/sockets.py`).
 
 ## Project Overview
 
-**OWL** (One-Way Latency) is a Python 3.11 tool for measuring one-way network latency between nodes on the FABRIC Testbed (and general networks). It uses PTP (Precision Time Protocol) for nanosecond-accurate timestamps and stores results in PCAP files or InfluxDB.
+**OWL** (One-Way Latency) measures one-way network latency between Linux hosts, like `ping` but one-way. Probes are timestamped by the NIC (`--clock hw`) or kernel (`--clock sw`) via `SO_TIMESTAMPING`; accuracy depends on PTP-synchronized clocks on both ends, which owl does not manage. Built for the FABRIC testbed but deliberately FABRIC-agnostic — FABRIC-specific deployment, InfluxDB schema, API and dashboard live in the separate latency-dashboard repo.
 
-## Setup & Build
+Hard constraints: **Linux only, Python ≥ 3.9, standard library only** (no third-party runtime dependencies — don't add any). Keep 3.9 compatibility: no `match`, no runtime `X | Y` unions (annotations are fine with `from __future__ import annotations`).
 
-```bash
-# Compile the required C extension for PTP device access
-gcc -fPIC -shared -o owl/sock_ops/ptp_time.so owl/sock_ops/ptp_time.c
-
-# Create virtualenv and install deps
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Or via Docker (recommended):
-```bash
-docker build -t fabrictestbed/owl .
-```
-
-There is no test suite or linter configured in this project.
-
-## Running the Tools
-
-All four scripts are invoked directly with `sudo` (raw socket / tcpdump access required):
+## Commands
 
 ```bash
-# On sender node — periodically sends UDP probes stamped with PTP time
-sudo python owl/sock_ops/owl_sender.py --dest-ip <IP> --dest-port <PORT> \
-    --frequency <Hz> --duration <sec> --seq-n <start>
+pip install .                      # installs the `owl` console script
+python3 -m owl ping --help         # or run without installing
 
-# On receiver node — captures incoming probes to a rotating PCAP
-sudo python owl/sock_ops/owl_capturer.py --ip <local-IP> --port <PORT> \
-    --outfile <path/to/output.pcap> --pcap-sec <rotation-interval>
-
-# Live: tail PCAP → parse → push to InfluxDB
-python owl/data_ops/send_data.py --pcapfile <path> \
-    --token <token> --org <org> --url <url> --desttype cloud|local --bucket <bucket>
-
-# Batch: convert a complete PCAP to CSV
-python owl/data_ops/pcap_to_csv.py --pcapfile <path> --outfile <path>
+# Tests: packets tests run anywhere; loopback tests need Linux.
+python3 -m unittest discover -s tests -v
+# On macOS, run the full suite in a Linux container:
+docker run --rm --sysctl net.ipv6.conf.all.disable_ipv6=0 -v "$PWD":/src:ro -w /src \
+  python:3.9-slim python -B -m unittest discover -s tests -v
 ```
+
+Docker is only a local test harness; owl itself is not deployed in Docker. Hardware timestamps can only be verified on real NICs (e.g. FABRIC VMs at PTP sites). No linter is configured.
 
 ## Architecture
 
 ```
 owl/
-├── sock_ops/           # Network measurement layer
-│   ├── owl_sender.py   # Periodic UDP probe sender (custom threading.Timer loop)
-│   ├── owl_capturer.py # tcpdump subprocess wrapper → PCAP output
-│   ├── ptp.py          # Python wrapper around the C extension
-│   └── ptp_time.c      # C extension: reads /dev/ptp* via ioctl for PTP hardware time
-│
-└── data_ops/           # Post-capture processing layer
-    ├── send_data.py    # Live: tail -f | tcpdump pipeline → parse → InfluxDB write
-    └── pcap_to_csv.py  # Batch: Scapy reads PCAP → CSV with computed latency
+├── packets.py   # wire format (16-byte probe, 24-byte report) + SCM_TIMESTAMPING / sock_extended_err parsing; pure, no Linux deps
+├── sockets.py   # TimestampedSocket (SO_TIMESTAMPING, OPT_ID TX-timestamp tokens), SIOCSHWTSTAMP, iface lookup via `ip -j addr`
+├── ping.py      # Pinger (probe sender), Reflector, Result, summarize()
+├── cli.py       # argparse: `owl ping`, `owl reflect`
+└── __main__.py  # python -m owl
+tests/           # unittest: test_packets.py (portable), test_loopback.py (Linux)
 ```
 
-### Data Flow
+### Key design points
 
-1. **Sender** stamps each UDP packet payload as `"<ptp_timestamp_ns>,<seq_number>"` and sends at a configured frequency.
-2. **Receiver** runs `tcpdump` in a subprocess with nanosecond precision (`--time-stamp-precision nano`, `-j adapter_unsynced`) and writes to a rotating PCAP.
-3. **Processing** parses the payload, extracts the send timestamp, and computes latency as `recv_time − send_time` using `decimal.Decimal` to avoid floating-point loss.
-
-### Key Design Details
-
-- **PTP device discovery**: `ptp.py` runs `ps -ef | grep phc2sys` and parses the process arguments to find which `/dev/ptp*` device is in use. If none is found, it exits (non-recoverable).
-- **System clock fallback**: Pass `--sys-clock` to `owl_sender.py` to use `time.time_ns()` instead of PTP hardware time (for testing without a PTP device).
-- **Interface discovery**: `psutil.net_if_addrs()` maps the user-supplied IP to a network interface name; falls back to `'any'` if not found.
-- **InfluxDB dual-client**: `send_data.py` branches on `--desttype` between `influxdb_client` (v2 local) and `influxdb_client_3` (v3 cloud), writing `latency`, `seq`, `send_time`, and `recv_time` fields with `sender`/`receiver` tags.
-- **Subprocess management**: `owl_capturer.py` tracks the tcpdump PID explicitly and sends SIGTERM on duration expiry. `send_data.py` uses a `tail -f | tcpdump -r` pipeline for live streaming.
-
-### System Prerequisites
-
-PTP synchronization (`phc2sys`, `ptp4l`), `tcpdump`, and `gcc` must be installed on the host. These are not managed by this Python project.
+- **One-way latency** = reflector's RX timestamp (carried back in the report) − sender's TX timestamp. The report's own travel time doesn't enter the calculation. `rtt` is printed only as a sanity check (includes reflector turnaround).
+- **TX timestamp matching**: `SOF_TIMESTAMPING_OPT_ID | OPT_TSONLY`. `TimestampedSocket.send()` returns a `(generation, key)` token; error-queue entries come back with the same token. On a failed `sendto()` the socket resets the kernel counter (toggle SO_TIMESTAMPING) and bumps the generation, so tokens can never be off by one.
+- **Pinger** keeps each probe pending until it has both the TX timestamp and the report (either order), or the timeout expires. Statuses: `ok`, `lost`, `no_tx_ts`, `no_rx_ts`, `send_failed`.
+- **Reflector** replies to the probe's source address/port, and returns the timestamp kind the probe asked for (`FLAG_HW`) — `rx_ns=0` if unavailable, never a substitute.
+- **session** (random u32 per sender run) filters stale or foreign reports.
+- **`--clock hw`** calls `SIOCSHWTSTAMP` (TX on, RX filter ALL) — NIC-wide, needs `CAP_NET_ADMIN`. HW timestamps are in the NIC's PHC timebase (often TAI); SW timestamps are CLOCK_REALTIME. Never mix.
+- Default port **49005**. `owl ping` uses an ephemeral source port.
+- SIGTERM is treated like Ctrl-C (clean shutdown with summary).

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "owl"
+dynamic = ["version"]
+description = "One-way latency measurement using kernel and NIC packet timestamps"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+# Intentionally empty: owl uses only the Python standard library.
+dependencies = []
+
+[project.scripts]
+owl = "owl.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "owl.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["owl*"]

@@ -158,19 +158,48 @@ Changes from 2026-04:
 - API: `/latest` returns samples less than 2 intervals old, and `/latency` agrees with the raw data.
 - Backfill: old IP-tagged series appear under the correct sites for each dated range.
 
+## Phase 1 implementation notes (2026-11-24)
+
+Decisions made while building, which refine the design above:
+
+- **Wire format.**
+  - Probe: 16 bytes, `ver, type, flags, reserved, session:u32, seq:u64`, optionally padded with `-s`.
+  - Report: 24 bytes, the header plus `rx_ns:u64`.
+  - `session` is random for each sender run, so stale or foreign reports are ignored.
+  - `FLAG_HW` in a probe asks for the hardware RX timestamp; without it the reflector returns the software one. The reflector returns `rx_ns=0` rather than substituting a timestamp of the other kind.
+- **TX timestamps are matched with `SOF_TIMESTAMPING_OPT_ID` keys**, not by "send, then read the next error-queue entry" as in the April plan. Report sends and driver delays can interleave error-queue entries, so ordering isn't reliable.
+  - After a failed `sendto()`, the socket resets the kernel counter (toggling SO_TIMESTAMPING) and starts a new token generation, so matching can never drift off by one.
+  - This also makes the daemon's batched sends (Phase 2) straightforward: no blocking wait after each probe.
+- **Reports go back to the probe's source address and port.** `owl ping` uses an ephemeral port, so it can probe a host running the daemon on 49005, even from a host that runs the daemon itself. The single default port is 49005 (49006 from the April plan is dropped).
+- **`owl reflect`** is a standalone reflector, like `iperf -s`, so ad-hoc tests don't need the daemon.
+- **`--clock hw|sw`.**
+  - Software timestamps (kernel, `CLOCK_REALTIME`) are a first-class mode, not just a test fallback.
+  - Hardware timestamps are in the NIC PHC's timebase, often TAI, about 37 s ahead of UTC. Never mix the two kinds.
+- **The April plan's `SOF_TIMESTAMPING_*` bit values were wrong** (TX_HARDWARE is `1<<0`, not `1<<2`). `owl/sockets.py` has the correct values from `linux/net_tstamp.h`.
+
+**Open risk the FABRIC hardware test must answer:** FABRIC VMs get time from the host through `ptp_kvm`, and `phc2sys` disciplines the VM's `CLOCK_REALTIME`. It is not known whether the VM's dataplane NIC hardware clock (a ConnectX VF) is itself disciplined to the grandmaster.
+- If it is not, hardware timestamps from different sites are not comparable, and `--clock sw` (kernel timestamps on the PTP-synced system clock, µs-level) becomes the default for FABRIC.
+- A later option is to translate hardware timestamps into system time with `PTP_SYS_OFFSET`.
+
+What to check, on two VMs at different PTP sites:
+1. `ethtool -T <dataplane iface>` on both.
+2. `owl ping --clock hw` vs `--clock sw` between them: compare `owl` against `rtt/2`, and check that `owl` doesn't jump by about 37 s or drift.
+3. Both directions (A→B and B→A).
+4. Repeat over FABNetv6.
+
 ## Implementation checklist
 
 ### Phase 0: housekeeping
 - [x] Save this plan to `.claude/owl2-plan.md` (2026-11-24)
-- [ ] Tag the last v1 commit `v1-final`; create a working branch for owl2
-- [ ] Point CLAUDE.md at this plan
+- [x] Tag the last v1 commit `v1-final` (c9e84a0); create the `owl2` branch (2026-11-24)
+- [x] Point CLAUDE.md at this plan (2026-11-24)
 
 ### Phase 1: owl core (this repo)
-- [ ] Scaffolding: `pyproject.toml` with no dependencies, the `owl/` package, delete the v1 code, `Dockerfile` and `requirements.txt`
-- [ ] `packets.py`: versioned probe/report pack and unpack, the `SCM_TIMESTAMPING` parser (offline unit tests)
-- [ ] `sockets.py`: v4/v6 timestamped socket, `SIOCSHWTSTAMP`, `wait_tx_timestamp`, `drain_errqueue`, interface lookup without psutil
-- [ ] `owl ping`: per-probe output, summary, `--json`
-- [ ] Two-node hardware test on FABRIC, over FABNetv4 and FABNetv6
+- [x] Scaffolding: `pyproject.toml` with no dependencies, the `owl/` package, delete the v1 code, `Dockerfile` and `requirements.txt` (2026-11-24)
+- [x] `packets.py`: versioned probe/report pack and unpack, the `SCM_TIMESTAMPING` / `sock_extended_err` parsers (offline unit tests) (2026-11-24)
+- [x] `sockets.py`: v4/v6 `TimestampedSocket` with OPT_ID TX tokens, `SIOCSHWTSTAMP`, interface lookup via `ip -j addr` (2026-11-24)
+- [x] `owl ping` (per-probe output, summary, `--json`) and `owl reflect`. Loopback tests pass with software timestamps on Linux, Python 3.9, IPv4 and IPv6 (2026-11-24)
+- [ ] Two-node hardware test on FABRIC, over FABNetv4 and FABNetv6. **Run this before Phase 2.** It also settles the clock-domain question in "Phase 1 implementation notes" below.
 
 ### Phase 2: owl daemon (this repo)
 - [ ] JSON config with labels; the daemon event loop; counters
