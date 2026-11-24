@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Active Redesign
+
+This project is being rewritten as **owl2** (v2.0, developed on the `owl2` branch; the last v1 commit is tagged `v1-final`). The architecture, decisions, and step-by-step implementation checklist are in **`.claude/owl2-plan.md`** — read that first before making any changes. The checklist at the bottom of that file tracks which steps are done and what comes next.
+
+`.claude/owl-redesign-plan.md` (2026-04) is superseded as the top-level plan but remains the detailed reference for the measurement core (`SO_TIMESTAMPING` socket setup, event loop, `MSG_ERRQUEUE` handling). Where the two conflict, `owl2-plan.md` wins.
+
+The sections below describe the **v1** code still in the tree; it will be deleted in owl2 Phase 1.
+
 ## Project Overview
 
 **OWL** (One-Way Latency) is a Python 3.11 tool for measuring one-way network latency between nodes on the FABRIC Testbed (and general networks). It uses PTP (Precision Time Protocol) for nanosecond-accurate timestamps and stores results in PCAP files or InfluxDB.
