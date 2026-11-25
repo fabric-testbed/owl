@@ -10,7 +10,7 @@ import sys
 from typing import List, Optional, Tuple
 
 from . import __version__, packets
-from .daemon import Daemon, load_config
+from .daemon import Daemon, load_config, log_stderr
 from .ping import (
     DEFAULT_PORT,
     LOST,
@@ -267,11 +267,16 @@ def cmd_daemon(args) -> int:
         return 0
     sinks = []
     try:
-        for spec in cfg.sinks:
-            sinks.append(make_sink(spec))
-    except OSError as e:
-        raise SetupError(f"cannot open sink {spec}: {e.strerror}") from None
-    daemon = Daemon(cfg, sinks)
+        for i, spec in enumerate(cfg.sinks):
+            try:
+                sinks.append(make_sink(spec, log=log_stderr))
+            except (OSError, ValueError) as e:
+                raise SetupError(f"sinks[{i}] ({spec['type']}): {getattr(e, 'strerror', None) or e}") from None
+        daemon = Daemon(cfg, sinks)
+    except BaseException:
+        for s in sinks:
+            s.close()
+        raise
     daemon.log(f"owl {__version__} started: {daemon.describe()}")
     try:
         daemon.run()

@@ -55,7 +55,7 @@ from .ping import (
     open_reflector,
     resolve,
 )
-from .sinks import SINK_TYPES, Sink
+from .sinks import Sink, validate_spec
 from .sockets import TimestampedSocket, iface_for_addr, source_sockaddr_for
 
 
@@ -93,7 +93,6 @@ class Config:
 _TOP_KEYS = {"label", "peers", "clock", "port", "interval", "timeout", "size", "ifaces", "listen",
              "stats_interval", "sinks"}
 _PEER_KEYS = {"addr", "label"}
-_SINK_KEYS = {"jsonl": {"type", "path"}}
 
 
 def _check_keys(obj: dict, allowed: set, where: str) -> None:
@@ -171,12 +170,10 @@ def parse_config(obj: Any) -> Config:
         if not isinstance(sinks, list) or not sinks:
             raise ConfigError("sinks must be a non-empty list")
         for i, s in enumerate(sinks):
-            where = f"sinks[{i}]"
-            if not isinstance(s, dict) or s.get("type") not in SINK_TYPES:
-                raise ConfigError(f"{where} must be an object with type one of: {', '.join(SINK_TYPES)}")
-            _check_keys(s, _SINK_KEYS[s["type"]], where)
-            if "path" in s:
-                _string(s["path"], f"{where}.path")
+            try:
+                validate_spec(s)
+            except ValueError as e:
+                raise ConfigError(f"sinks[{i}]: {e}") from None
         cfg.sinks = sinks
     return cfg
 
@@ -207,14 +204,14 @@ class _Peer:
         self.next_send = 0.0
 
 
-def _stderr(msg: str) -> None:
+def log_stderr(msg: str) -> None:
     print(f"owl daemon: {msg}", file=sys.stderr, flush=True)
 
 
 class Daemon:
     """The daemon's sockets and loop. Construct, then ``run()``; ``close()`` when done."""
 
-    def __init__(self, cfg: Config, sinks: List[Sink], log: Callable[[str], None] = _stderr) -> None:
+    def __init__(self, cfg: Config, sinks: List[Sink], log: Callable[[str], None] = log_stderr) -> None:
         self.cfg = cfg
         self.sinks = sinks
         self.log = log
@@ -268,6 +265,8 @@ class Daemon:
 
     def _emit(self, record: Dict[str, Any]) -> None:
         for sink in self.sinks:
+            if not sink.wants(record):
+                continue
             try:
                 sink.emit(record)
             except Exception as e:  # a sink must never stop measurement
@@ -311,8 +310,15 @@ class Daemon:
             "pending": sum(e.pending for e in self.engines.values()),
             "reflected": self.reflector.probes,
             "reflect_errors": self.reflector.errors,
-            "sink_dropped": sum(s.dropped for s in self.sinks),
+            **self._sink_stats(),
         }
+
+    def _sink_stats(self) -> Dict[str, int]:
+        totals: Counter = Counter()
+        for s in self.sinks:
+            totals.update(s.stats())
+        totals.setdefault("sink_dropped", 0)
+        return dict(totals)
 
     def log_stats(self) -> None:
         st = self.stats()

@@ -115,10 +115,12 @@ Changes from 2026-04:
   6. Restart the daemon only if the config changed.
   7. Renew the slice if needed.
   8. Write `sites.json` (site, VM, IPs, lat/lon, `since`) and publish it to the API host.
-- **Data model (InfluxDB v2):**
-  - Measurement `owl`.
-  - Tags: `src_site, dst_site, src_ip, dst_ip, af`.
-  - Fields: `latency_ns, seq, tx_hw_ns, rx_hw_ns, ptp_ok`.
+- **Data model (InfluxDB v2):** what owl's `http-lineprotocol` sink writes (revised 2026-11-25, when the sink was built):
+  - Measurement `owl` for probes and `owl_stats` for counters.
+  - Probe tags: `src_label, dst_label` (the slice manager sets them to site names), `src_ip, dst_ip, af` (address family, 4 or 6), `clock`, `status`.
+  - Probe fields: `seq, owl_ns, rtt_ns, tx_ns, rx_ns`, plus `ptp_ok` once the clock-health guard exists.
+  - Lost probes are written too, without `owl_ns`/`rtt_ns`, so loss is queryable by `status`.
+  - Changes from the original draft: `src_site/dst_site` became `src_label/dst_label`, because owl stays FABRIC-agnostic. `latency_ns` became `owl_ns`, matching `owl ping`. `tx_hw_ns/rx_hw_ns` became `tx_ns/rx_ns`, because they are software timestamps in sw mode and the `clock` tag says which.
   - Raw samples go to `owl_raw` (~7 d retention); summaries go to `owl_1m` (kept indefinitely).
   - Rough load: 30 sites × 29 peers / 5 s ≈ 174 points/s raw, ≈ 15 points/s summaries.
 - **API:** Flask routes on the Dash server. It is the only component that knows Flux, and all queries are parameterized. Endpoints:
@@ -245,7 +247,14 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
 - **Startup delay:** probing starts 0.2 s after the sockets open. The first socket on a host to ask for software RX timestamps makes the kernel enable them through deferred work (`net_enable_timestamp`), and in testing about 1 in 3 fresh starts got `no_rx_ts` on seq 0 without the delay.
 - **Records:** `probe` records carry `time_ns, src_label, dst_label, src_ip, dst_ip, af, clock, seq, status, owl_ns, rtt_ns, tx_ns, rx_ns` (and `error`). `stats` records carry the cumulative counters (`sent`, each status, `pending`, `reflected`, `reflect_errors`, `sink_dropped`). The stats are also logged to stderr every `stats_interval`.
 - **Config** is strict: unknown keys are errors, so typos fail `owl daemon --check`, which the slice manager can run before restarting the service.
-- **Not yet:** `http-lineprotocol` sink, summaries, the `ptp_ok` guard, config reload (the slice manager restarts the service instead).
+- **`http-lineprotocol` sink:**
+  - `emit()` only appends to a bounded deque, and a sender thread POSTs batches (gzip, `Authorization: Token`). A slow endpoint can't stall the selector loop, which would also make probes expire as falsely `lost`.
+  - A failed batch (network error, 429, 5xx) is retried before anything newer, with backoff of 1 s doubling to 60 s. New records arriving during an outage do not cut the backoff short.
+  - Other 4xx: the batch is dropped as rejected and logged.
+  - When full, the buffer drops the oldest lines. `close()` spends up to 5 s delivering what is left.
+  - Sinks take `records: [...]` to receive only probes or only stats.
+- **Verified against InfluxDB 2.7 in Docker (2026-11-25):** daemon at 0.2 s interval with two peers over IPv4 and IPv6, InfluxDB stopped from about 6 s to 14 s. Measurement was unaffected (297/297 ok). Delivery resumed 15 s after the first failure, and InfluxDB held 149 + 148 = 297 probe points exactly once, plus 15 stats points. Labels with spaces were escaped correctly.
+- **Not yet:** summaries, the `ptp_ok` guard, config reload (the slice manager restarts the service instead).
 
 ## Implementation checklist
 
@@ -265,7 +274,7 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
 
 ### Phase 2: owl daemon (this repo)
 - [x] JSON config with labels; the daemon event loop; counters; `jsonl` sink (2026-11-25). See "Phase 2 implementation notes"
-- [ ] Sinks: stdout/jsonl, `http-lineprotocol` with a bounded retry buffer
+- [x] Sinks: stdout/jsonl, `http-lineprotocol` with a bounded retry buffer (2026-11-25). Verified against a real InfluxDB 2.7 with an 8 s outage: all 297 probes stored once, in order
 - [ ] Per-peer summaries; clock-health guard (`ptp_ok`)
 - [ ] systemd unit, zipapp build, README
 - [ ] 3-node test with InfluxDB, including an outage test

@@ -10,8 +10,8 @@ FABRIC-specific code. It uses only the Python standard library, so there is
 nothing to install besides Python 3.9+.
 
 > **Status:** owl2 rewrite in progress (branch `owl2`). `owl ping`,
-> `owl reflect` and `owl daemon` (JSON Lines output) work. Pushing to InfluxDB,
-> per-peer summaries and a clock-health flag are next. v1 (Docker + tcpdump +
+> `owl reflect` and `owl daemon` (JSON Lines and InfluxDB output) work.
+> Per-peer summaries and a clock-health flag are next. v1 (Docker + tcpdump +
 > PCAP) is preserved at tag `v1-final`.
 
 ## Requirements
@@ -138,9 +138,52 @@ Config keys (only `label` and `peers` are required):
 | `ifaces` | found from the routes to the peers | interfaces to enable hardware timestamping on |
 | `listen` | all IPv4 and IPv6 addresses | addresses to listen on |
 | `stats_interval` | 60 | seconds between stats records and log lines |
-| `sinks` | `[{"type": "jsonl", "path": "-"}]` | where records go; `"-"` is stdout |
+| `sinks` | `[{"type": "jsonl", "path": "-"}]` | where records go (see below) |
 
 Unknown keys are rejected, so a typo fails `--check` instead of being silently ignored.
+
+### Sinks
+
+**`jsonl`**: one JSON object per line. `"path": "-"` (the default) is stdout; any
+other path is appended to.
+
+**`http-lineprotocol`**: batches records as InfluxDB line protocol and POSTs them.
+It works with InfluxDB v2 and v3, Telegraf, VictoriaMetrics, or anything else that
+accepts line protocol over HTTP:
+
+```json
+{"type": "http-lineprotocol",
+ "url": "https://influx.example.org:8086/api/v2/write?org=fabric&bucket=owl_raw&precision=ns",
+ "token_file": "/etc/owl/influx-token"}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `url` | — | write endpoint, including org/bucket query parameters for InfluxDB v2 |
+| `token` / `token_file` | none | sent as `Authorization: Token …`; prefer a file readable only by root |
+| `measurement` | `owl` | measurement for probe records |
+| `stats_measurement` | `owl_stats` | measurement for stats records |
+| `batch_size` | 5000 | most lines per POST |
+| `flush_interval` | 10 | seconds between POSTs when no full batch is waiting |
+| `max_buffer` | 100000 | lines held in memory while the endpoint is unreachable |
+| `timeout` | 10 | seconds per HTTP request |
+| `gzip` | true | compress request bodies |
+
+Any sink also takes `"records": ["probe"]` or `["stats"]` to receive only one kind,
+for example to send stats to a different bucket.
+
+Probe records are written as measurement `owl` with tags `src_label`, `dst_label`,
+`src_ip`, `dst_ip`, `af`, `clock` and `status`, and integer fields `seq`, `owl_ns`,
+`rtt_ns`, `tx_ns` and `rx_ns`. A lost probe is still written, but with no `owl_ns`
+or `rtt_ns`, so loss can be counted from the `status` tag.
+
+Sending happens on a background thread, so a slow or unreachable endpoint never
+delays probing. While the endpoint is down, lines wait in memory and are retried
+in order, with backoff up to 60 s. If the buffer fills, the oldest lines are
+dropped and counted. A 4xx response other than 429 (for example a bad token) means
+retrying can't help: that batch is dropped and the error is logged. The stats
+records count drops (`sink_dropped`), the backlog (`sink_buffered`) and failed
+attempts (`sink_failed_posts`).
 
 ## Hardware vs software timestamps
 

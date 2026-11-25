@@ -117,6 +117,31 @@ class TestDaemonLoopback(unittest.TestCase):
         self.assertEqual(by.get("lo4"), {ping.OK})
         self.assertEqual(by.get("nobody"), {ping.LOST})
 
+    def test_http_sink_wiring(self):
+        """Probe records reach an HTTP sink as line protocol; a stats-only sink gets only stats."""
+        from test_sinks import _Server, wait_for
+        from owl.sinks import HttpLineProtocolSink
+
+        server = _Server()
+        try:
+            http = HttpLineProtocolSink(server.url, flush_interval=0.05, log=lambda m: None)
+            stats_only = ListSink(records=["stats"])
+            daemon, sink, _ = self.make()
+            daemon.sinks += [http, stats_only]
+            try:
+                self.run_for(daemon, 0.6)
+                daemon.log_stats()
+                self.assertTrue(wait_for(lambda: any(l.startswith("owl,") for l in server.lines)))
+            finally:
+                daemon.close()
+        finally:
+            server.close()
+        probes = [l for l in server.lines if l.startswith("owl,")]
+        self.assertGreaterEqual(len(probes), 5)
+        self.assertTrue(all(",src_label=self,status=ok " in l for l in probes), probes[:2])
+        self.assertTrue(stats_only.records and all(r["type"] == "stats" for r in stats_only.records))
+        self.assertIn("sink_buffered", sink.records[-1], "HTTP sink counters merged into stats")
+
     def test_cli_check_and_jsonl_sink(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "owl.jsonl")

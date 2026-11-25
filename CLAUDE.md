@@ -37,10 +37,10 @@ owl/
 ├── sockets.py   # TimestampedSocket (SO_TIMESTAMPING, OPT_ID TX-timestamp tokens), SIOCSHWTSTAMP, iface lookup via `ip -j addr`
 ├── ping.py      # ProbeEngine (send + match TX ts/report → Result), Pinger (one peer), Reflector, summarize()
 ├── daemon.py    # `owl daemon`: JSON config (parse_config), Daemon selector loop (reflector + one engine per family), counters
-├── sinks.py     # record sinks: JsonlSink (stdout/file); make_sink()
+├── sinks.py     # record sinks: JsonlSink, HttpLineProtocolSink (background sender thread, bounded buffer, retry/backoff), to_line_protocol(), validate_spec()/make_sink()
 ├── cli.py       # argparse: `owl ping`, `owl reflect`, `owl daemon`
 └── __main__.py  # python -m owl
-tests/           # unittest: test_packets.py, test_config.py (portable); test_loopback.py, test_daemon.py (Linux)
+tests/           # unittest: test_packets.py, test_config.py, test_sinks.py (portable); test_loopback.py, test_daemon.py (Linux)
 examples/        # owl-daemon.json example config
 docs/            # clock-chain.md: which clocks a measurement depends on (FABRIC host/ptp_kvm/VF PHC), failure modes, test results; keep it current when clock handling changes
 dev/             # FABRIC validation notebooks (not part of the package), e.g. the two-node hw test
