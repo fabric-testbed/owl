@@ -9,9 +9,10 @@ It was built for the [FABRIC testbed](https://fabric-testbed.net/) but has no
 FABRIC-specific code. It uses only the Python standard library, so there is
 nothing to install besides Python 3.9+.
 
-> **Status:** owl2 rewrite in progress (branch `owl2`). `owl ping` and
-> `owl reflect` work. The long-running daemon that probes many peers and pushes
-> to InfluxDB is next. v1 (Docker + tcpdump + PCAP) is preserved at tag `v1-final`.
+> **Status:** owl2 rewrite in progress (branch `owl2`). `owl ping`,
+> `owl reflect` and `owl daemon` (JSON Lines output) work. Pushing to InfluxDB,
+> per-peer summaries and a clock-health flag are next. v1 (Docker + tcpdump +
+> PCAP) is preserved at tag `v1-final`.
 
 ## Requirements
 
@@ -97,6 +98,49 @@ Exit status is 0 if at least one probe was measured, 1 if none were, and 2 on a 
 If the reflector has no hardware timestamp for a probe that asked for one, it
 answers with "no timestamp" rather than substituting a software time.
 `owl ping` reports that as `reflector returned no hw RX timestamp`.
+
+## Running as a daemon
+
+`owl daemon` is for continuous monitoring of a set of peers, for example one
+host per site, each running the daemon and listing the others:
+
+```bash
+owl daemon -c examples/owl-daemon.json --check   # validate the config, open nothing
+sudo owl daemon -c examples/owl-daemon.json
+```
+
+The daemon does both jobs in one process:
+- it answers probes on port 49005, like `owl reflect`, so other daemons and `owl ping` can probe it;
+- it probes every peer once per `interval`, spread evenly across the interval rather than in bursts.
+
+Each probe becomes one JSON line in the sink (values here are illustrative). The `src_label` and `dst_label` fields come
+straight from the config, so you can use site names, hostnames, or anything else:
+
+```json
+{"type":"probe","time_ns":1795644249182783846,"src_label":"STAR","dst_label":"PSC","src_ip":"10.129.138.2","dst_ip":"10.140.135.2","af":4,"clock":"hw","seq":42,"status":"ok","owl_ns":24408113,"rtt_ns":48903220,"tx_ns":1795644249182790000,"rx_ns":1795644249207198113}
+```
+
+Every `stats_interval` seconds it also writes a `"type":"stats"` record with
+cumulative counters (probes sent, each status, reflected, sink drops) and logs the
+same counters to stderr, which systemd sends to the journal. SIGTERM stops it cleanly.
+
+Config keys (only `label` and `peers` are required):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `label` | — | this host's label, written as `src_label` |
+| `peers` | — | list of `{"addr": ..., "label": ...}`; `label` defaults to the address. List a peer's IPv4 and IPv6 addresses separately to measure both. |
+| `clock` | `"hw"` | `"hw"` or `"sw"`, as for `owl ping` |
+| `port` | 49005 | port to listen on and to probe peers on |
+| `interval` | 5 | seconds between probes to each peer |
+| `timeout` | 2 | seconds to wait for each report before counting the probe lost |
+| `size` | 16 | probe payload size in bytes |
+| `ifaces` | found from the routes to the peers | interfaces to enable hardware timestamping on |
+| `listen` | all IPv4 and IPv6 addresses | addresses to listen on |
+| `stats_interval` | 60 | seconds between stats records and log lines |
+| `sinks` | `[{"type": "jsonl", "path": "-"}]` | where records go; `"-"` is stdout |
+
+Unknown keys are rejected, so a typo fails `--check` instead of being silently ignored.
 
 ## Hardware vs software timestamps
 

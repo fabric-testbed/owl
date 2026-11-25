@@ -35,10 +35,13 @@ Docker is only a local test harness; owl itself is not deployed in Docker. Hardw
 owl/
 ├── packets.py   # wire format (16-byte probe, 24-byte report) + SCM_TIMESTAMPING / sock_extended_err parsing; pure, no Linux deps
 ├── sockets.py   # TimestampedSocket (SO_TIMESTAMPING, OPT_ID TX-timestamp tokens), SIOCSHWTSTAMP, iface lookup via `ip -j addr`
-├── ping.py      # Pinger (probe sender), Reflector, Result, summarize()
-├── cli.py       # argparse: `owl ping`, `owl reflect`
+├── ping.py      # ProbeEngine (send + match TX ts/report → Result), Pinger (one peer), Reflector, summarize()
+├── daemon.py    # `owl daemon`: JSON config (parse_config), Daemon selector loop (reflector + one engine per family), counters
+├── sinks.py     # record sinks: JsonlSink (stdout/file); make_sink()
+├── cli.py       # argparse: `owl ping`, `owl reflect`, `owl daemon`
 └── __main__.py  # python -m owl
-tests/           # unittest: test_packets.py (portable), test_loopback.py (Linux)
+tests/           # unittest: test_packets.py, test_config.py (portable); test_loopback.py, test_daemon.py (Linux)
+examples/        # owl-daemon.json example config
 docs/            # clock-chain.md: which clocks a measurement depends on (FABRIC host/ptp_kvm/VF PHC), failure modes, test results; keep it current when clock handling changes
 dev/             # FABRIC validation notebooks (not part of the package), e.g. the two-node hw test
 ```
@@ -47,7 +50,8 @@ dev/             # FABRIC validation notebooks (not part of the package), e.g. t
 
 - **One-way latency** = reflector's RX timestamp (carried back in the report) − sender's TX timestamp. The report's own travel time doesn't enter the calculation. `rtt` is printed only as a sanity check (includes reflector turnaround).
 - **TX timestamp matching**: `SOF_TIMESTAMPING_OPT_ID | OPT_TSONLY`. `TimestampedSocket.send()` returns a `(generation, key)` token; error-queue entries come back with the same token. On a failed `sendto()` the socket resets the kernel counter (toggle SO_TIMESTAMPING) and bumps the generation, so tokens can never be off by one.
-- **Pinger** keeps each probe pending until it has both the TX timestamp and the report (either order), or the timeout expires. Statuses: `ok`, `lost`, `no_tx_ts`, `no_rx_ts`, `send_failed`.
+- **ProbeEngine** keeps each probe pending until it has both the TX timestamp and the report (either order), or the timeout expires. Statuses: `ok`, `lost`, `no_tx_ts`, `no_rx_ts`, `send_failed`. `send(sockaddr, target)` takes an opaque target that comes back with the Result, so one engine serves many peers; the caller owns the event loop (`handle_readable`, `expire`, `next_deadline`).
+- **Daemon**: one thread, one selector. Reflector sockets on the listen port plus one wildcard-bound ProbeEngine socket per address family (ephemeral port). Peers are staggered across `interval`; missed rounds after a stall are skipped, not burst. Probing starts 0.2 s after the sockets open (kernel enables sw RX timestamps asynchronously). Sinks must never raise; drops are counted. Config validation rejects unknown keys.
 - **Reflector** replies to the probe's source address/port, and returns the timestamp kind the probe asked for (`FLAG_HW`) — `rx_ns=0` if unavailable, never a substitute.
 - **session** (random u32 per sender run) filters stale or foreign reports.
 - **`--clock sw`** TX timestamps are `SOF_TIMESTAMPING_TX_SCHED` (taken at queueing, works on every driver), not `TX_SOFTWARE`, which ConnectX VFs on FABRIC never produce.

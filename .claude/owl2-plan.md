@@ -1,7 +1,7 @@
 # owl2 — Architecture & Implementation Plan
 
 **Created:** 2026-11-24
-**Last updated:** 2026-11-25 (second FABRIC run; sw mode uses TX_SCHED)
+**Last updated:** 2026-11-25 (Phase 2 started: daemon, config, jsonl sink)
 
 This document supersedes `.claude/owl-redesign-plan.md` (2026-04) as the top-level plan. That file is still the detailed reference for the measurement core (socket setup, event loop, `MSG_ERRQUEUE` handling, hardware-timestamp filter). owl2 keeps that core and changes everything around it. Where the two conflict, this file wins.
 
@@ -236,6 +236,17 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
 - **FABlib pitfall:** `node.execute(timeout=N)` runs `sudo timeout N <cmd>`, which breaks commands that start with a shell builtin such as `cd`.
 - **Image:** `default_ubuntu_22` works with the playbook. This partly settles the image question in "Still open".
 
+## Phase 2 implementation notes (2026-11-25)
+
+- **`ProbeEngine` (in `ping.py`)** now holds the probe/TX-timestamp/report matching that was inside `Pinger`. `send(sockaddr, target)` returns the target with each Result, so one engine probes many peers. `Pinger` is a single-peer loop around it, and `owl ping` output is unchanged.
+- **Sockets:** the daemon probes from one wildcard-bound socket per address family on an ephemeral port, and reflects on the listen port (default 49005, all addresses), using the same `Reflector` as `owl reflect`. Each peer's source IP for the records is looked up from the routing table at startup. A peer with no route only logs a warning, and its sends are counted as `send_failed` until the route returns.
+- **hw interfaces** are found from the routes to the peers unless the config sets `ifaces`.
+- **Scheduling:** each peer is probed every `interval`, staggered evenly across it. After a stall, missed rounds are skipped rather than sent in a burst.
+- **Startup delay:** probing starts 0.2 s after the sockets open. The first socket on a host to ask for software RX timestamps makes the kernel enable them through deferred work (`net_enable_timestamp`), and in testing about 1 in 3 fresh starts got `no_rx_ts` on seq 0 without the delay.
+- **Records:** `probe` records carry `time_ns, src_label, dst_label, src_ip, dst_ip, af, clock, seq, status, owl_ns, rtt_ns, tx_ns, rx_ns` (and `error`). `stats` records carry the cumulative counters (`sent`, each status, `pending`, `reflected`, `reflect_errors`, `sink_dropped`). The stats are also logged to stderr every `stats_interval`.
+- **Config** is strict: unknown keys are errors, so typos fail `owl daemon --check`, which the slice manager can run before restarting the service.
+- **Not yet:** `http-lineprotocol` sink, summaries, the `ptp_ok` guard, config reload (the slice manager restarts the service instead).
+
 ## Implementation checklist
 
 ### Phase 0: housekeeping
@@ -253,7 +264,7 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
 - [ ] Rerun the two-node test with PTP working on both VMs to confirm `--clock sw` end to end on FABRIC
 
 ### Phase 2: owl daemon (this repo)
-- [ ] JSON config with labels; the daemon event loop; counters
+- [x] JSON config with labels; the daemon event loop; counters; `jsonl` sink (2026-11-25). See "Phase 2 implementation notes"
 - [ ] Sinks: stdout/jsonl, `http-lineprotocol` with a bounded retry buffer
 - [ ] Per-peer summaries; clock-health guard (`ptp_ok`)
 - [ ] systemd unit, zipapp build, README

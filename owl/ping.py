@@ -1,9 +1,11 @@
-"""Probe sender (Pinger) and reflector: the measurement loops behind `owl ping` and `owl reflect`.
+"""Probe sending and reflecting: the measurement loops behind `owl ping`, `owl reflect` and `owl daemon`.
 
-Pinger sends probes from an ephemeral port and matches three things per probe:
-its own TX timestamp (from the error queue), the reflector's report carrying
-the RX timestamp, and the local arrival time of that report. These can arrive
-in any order, so each probe stays pending until all are in or it times out.
+ProbeEngine sends probes on one socket and matches three things per probe: its
+own TX timestamp (from the error queue), the reflector's report carrying the RX
+timestamp, and the local arrival time of that report. These can arrive in any
+order, so each probe stays pending until all are in or it times out. One engine
+can probe any number of peers (the daemon); Pinger drives one engine against a
+single peer (`owl ping`).
 
     one-way latency = reflector RX timestamp - our TX timestamp
     rtt             = report arrival here - our TX timestamp
@@ -12,13 +14,14 @@ in any order, so each probe stays pending until all are in or it times out.
 
 from __future__ import annotations
 
+import errno
 import os
 import selectors
 import socket
 import statistics
 import threading
 import time
-from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple
 
 from . import packets
 from .sockets import (
@@ -37,6 +40,7 @@ LOST = "lost"  # no report before the timeout
 NO_TX_TS = "no_tx_ts"  # the local kernel/NIC never produced a TX timestamp
 NO_RX_TS = "no_rx_ts"  # the reflector had no RX timestamp of the requested kind
 SEND_FAILED = "send_failed"
+STATUSES = (OK, LOST, NO_TX_TS, NO_RX_TS, SEND_FAILED)
 
 
 class SetupError(Exception):
@@ -80,11 +84,15 @@ def setup_hw_timestamping(iface: str) -> None:
         ) from None
 
 
-class _Pending:
-    __slots__ = ("seq", "deadline", "sent_unix_ns", "token", "tx_ns", "report", "report_arrival_ns")
+# --- Sending probes ---------------------------------------------------------------------
 
-    def __init__(self, seq: int, deadline: float, sent_unix_ns: int, token: Optional[TxToken]):
+
+class _Pending:
+    __slots__ = ("seq", "target", "deadline", "sent_unix_ns", "token", "tx_ns", "report", "report_arrival_ns")
+
+    def __init__(self, seq: int, target: Any, deadline: float, sent_unix_ns: int, token: Optional[TxToken]):
         self.seq = seq
+        self.target = target
         self.deadline = deadline
         self.sent_unix_ns = sent_unix_ns
         self.token = token
@@ -93,7 +101,124 @@ class _Pending:
         self.report_arrival_ns = 0
 
 
+Completed = Tuple[Any, Result]  # (target passed to send(), its result)
+
+
+class ProbeEngine:
+    """Sends probes on one TimestampedSocket and turns each into exactly one Result.
+
+    ``send()`` takes an opaque ``target`` (e.g. a peer object) that comes back
+    with the probe's Result, so one engine can serve many peers. Sequence
+    numbers are per engine, and ``session`` is random per engine, so reports
+    for another engine or an earlier run are ignored.
+
+    The caller owns the event loop: call ``handle_readable()`` when the socket is
+    readable and ``expire()`` at or after ``next_deadline()``.
+    """
+
+    def __init__(self, sock: TimestampedSocket, *, hw: bool, timeout: float, size: int = 0) -> None:
+        self.sock = sock
+        self.hw = hw
+        self.timeout = timeout
+        self.size = size
+        self.session = int.from_bytes(os.urandom(4), "big")
+        self._flags = packets.FLAG_HW if hw else 0
+        self._next_seq = 0
+        self._pending: Dict[int, _Pending] = {}
+        self._by_token: Dict[TxToken, int] = {}
+
+    def fileno(self) -> int:
+        return self.sock.fileno()
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    def next_deadline(self) -> Optional[float]:
+        return min((p.deadline for p in self._pending.values()), default=None)
+
+    def _pick(self, ts: Optional[packets.Timestamps]) -> int:
+        if ts is None:
+            return 0
+        return ts.hw_ns if self.hw else ts.sw_ns
+
+    def send(self, sockaddr: tuple, target: Any = None) -> Optional[Completed]:
+        """Send one probe. Returns its (target, Result) at once only if sendto() failed."""
+        seq = self._next_seq
+        self._next_seq += 1
+        data = packets.pack_probe(self.session, seq, self._flags, self.size)
+        sent_unix_ns = time.time_ns()
+        try:
+            token = self.sock.send(data, sockaddr)
+        except OSError as e:
+            return target, Result(seq, SEND_FAILED, sent_unix_ns, error=e.strerror or str(e))
+        self._pending[seq] = _Pending(seq, target, time.monotonic() + self.timeout, sent_unix_ns, token)
+        if token is not None:
+            self._by_token[token] = seq
+        return None
+
+    def handle_readable(self) -> List[Completed]:
+        """Read everything waiting on the socket; return the probes that completed."""
+        done: List[Completed] = []
+        while True:
+            item = self.sock.recv_tx_timestamp()
+            if item is None:
+                break
+            token, ts = item
+            seq = self._by_token.pop(token, None) if token is not None else None
+            p = self._pending.get(seq) if seq is not None else None
+            if p is not None:
+                p.tx_ns = self._pick(ts)
+                self._finish(p, done)
+
+        while True:
+            item = self.sock.recv()
+            if item is None:
+                break
+            data, _addr, ts = item
+            msg = packets.unpack(data)
+            if not isinstance(msg, packets.Report) or msg.session != self.session:
+                continue
+            p = self._pending.get(msg.seq)
+            if p is None or p.report is not None:
+                continue  # late or duplicate
+            p.report = msg
+            p.report_arrival_ns = self._pick(ts)
+            self._finish(p, done)
+        return done
+
+    def expire(self, now: Optional[float] = None) -> List[Completed]:
+        """Resolve every probe whose timeout has passed."""
+        now = time.monotonic() if now is None else now
+        done: List[Completed] = []
+        for p in [p for p in self._pending.values() if now >= p.deadline]:
+            self._finish(p, done, expired=True)
+        return done
+
+    def _finish(self, p: _Pending, done: List[Completed], expired: bool = False) -> None:
+        """Emit a Result once a probe is complete, or when it times out."""
+        if not expired and (p.tx_ns is None or p.report is None):
+            return
+        del self._pending[p.seq]
+        if p.token is not None:
+            self._by_token.pop(p.token, None)
+
+        r = p.report
+        if r is None:
+            result = Result(p.seq, LOST, p.sent_unix_ns, tx_ns=p.tx_ns or 0)
+        elif not p.tx_ns:
+            result = Result(p.seq, NO_TX_TS, p.sent_unix_ns, rx_ns=r.rx_ns)
+        elif r.rx_ns == 0 or bool(r.flags & packets.FLAG_HW) != self.hw:
+            result = Result(p.seq, NO_RX_TS, p.sent_unix_ns, tx_ns=p.tx_ns)
+        else:
+            rtt = p.report_arrival_ns - p.tx_ns if p.report_arrival_ns else None
+            result = Result(p.seq, OK, p.sent_unix_ns, p.tx_ns, r.rx_ns, r.rx_ns - p.tx_ns, rtt)
+        done.append((p.target, result))
+
+
 class Pinger:
+    """Probes one peer at a fixed interval (`owl ping`)."""
+
     def __init__(
         self,
         peer: str,
@@ -112,11 +237,6 @@ class Pinger:
         self.family, self.peer_sockaddr = resolve(peer, port, family)
         self.count = count
         self.interval = interval
-        self.timeout = timeout
-        self.hw = hw
-        self.size = size
-        self.session = int.from_bytes(os.urandom(4), "big")
-        self._flags = packets.FLAG_HW if hw else 0
 
         if source:
             _fam, bind_sockaddr = resolve(source, 0, self.family)
@@ -131,15 +251,12 @@ class Pinger:
                 raise SetupError(f"cannot find the interface that owns {self.source}; pass --iface")
             setup_hw_timestamping(self.iface)
 
-        self.sock = TimestampedSocket(self.family, bind_sockaddr, tx_timestamps=True, hw=hw)
+        sock = TimestampedSocket(self.family, bind_sockaddr, tx_timestamps=True, hw=hw)
+        self.engine = ProbeEngine(sock, hw=hw, timeout=timeout, size=size)
+        self.session = self.engine.session
 
     def close(self) -> None:
-        self.sock.close()
-
-    def _pick(self, ts: Optional[packets.Timestamps]) -> int:
-        if ts is None:
-            return 0
-        return ts.hw_ns if self.hw else ts.sw_ns
+        self.engine.sock.close()
 
     def results(self) -> Iterator[Result]:
         """Send probes and yield one Result per probe as each completes or times out.
@@ -147,100 +264,34 @@ class Pinger:
         Runs until ``count`` probes have all been resolved, or forever if count is
         None. Stop early by breaking out of the loop or with KeyboardInterrupt.
         """
+        engine = self.engine
         sel = selectors.DefaultSelector()
-        sel.register(self.sock.fileno(), selectors.EVENT_READ)
-        pending: Dict[int, _Pending] = {}
-        by_token: Dict[TxToken, int] = {}
-        done: List[Result] = []
-        seq = 0
+        sel.register(engine.fileno(), selectors.EVENT_READ)
+        sent = 0
         next_send = time.monotonic()
         try:
             while True:
                 now = time.monotonic()
-                more = self.count is None or seq < self.count
+                more = self.count is None or sent < self.count
                 if more and now >= next_send:
-                    self._send_probe(seq, pending, by_token, done)
-                    seq += 1
+                    failed = engine.send(self.peer_sockaddr)
+                    if failed:
+                        yield failed[1]
+                    sent += 1
                     next_send = max(next_send + self.interval, now)  # don't burst after a stall
-                    more = self.count is None or seq < self.count
+                    more = self.count is None or sent < self.count
 
-                for p in [p for p in pending.values() if now >= p.deadline]:
-                    self._finish(p, pending, by_token, done, expired=True)
-
-                yield from done
-                done.clear()
-                if not more and not pending:
+                for _t, r in engine.expire(now):
+                    yield r
+                if not more and not engine.pending:
                     return
 
-                wake = [p.deadline for p in pending.values()]
-                if more:
-                    wake.append(next_send)
+                wake = [d for d in (engine.next_deadline(), next_send if more else None) if d is not None]
                 if sel.select(max(0.0, min(wake) - time.monotonic())):
-                    self._drain(pending, by_token, done)
-                yield from done
-                done.clear()
+                    for _t, r in engine.handle_readable():
+                        yield r
         finally:
             sel.close()
-
-    def _send_probe(self, seq, pending, by_token, done) -> None:
-        data = packets.pack_probe(self.session, seq, self._flags, self.size)
-        sent_unix_ns = time.time_ns()
-        try:
-            token = self.sock.send(data, self.peer_sockaddr)
-        except OSError as e:
-            done.append(Result(seq, SEND_FAILED, sent_unix_ns, error=e.strerror or str(e)))
-            return
-        pending[seq] = _Pending(seq, time.monotonic() + self.timeout, sent_unix_ns, token)
-        if token is not None:
-            by_token[token] = seq
-
-    def _drain(self, pending, by_token, done) -> None:
-        while True:
-            item = self.sock.recv_tx_timestamp()
-            if item is None:
-                break
-            token, ts = item
-            seq = by_token.pop(token, None) if token is not None else None
-            p = pending.get(seq) if seq is not None else None
-            if p is not None:
-                p.tx_ns = self._pick(ts)
-                self._finish(p, pending, by_token, done)
-
-        while True:
-            item = self.sock.recv()
-            if item is None:
-                break
-            data, _addr, ts = item
-            msg = packets.unpack(data)
-            if not isinstance(msg, packets.Report) or msg.session != self.session:
-                continue
-            p = pending.get(msg.seq)
-            if p is None or p.report is not None:
-                continue  # late or duplicate
-            p.report = msg
-            p.report_arrival_ns = self._pick(ts)
-            self._finish(p, pending, by_token, done)
-
-    def _finish(self, p: _Pending, pending, by_token, done, expired: bool = False) -> None:
-        """Emit a Result once a probe is complete, or when it times out."""
-        if not expired and (p.tx_ns is None or p.report is None):
-            return
-        del pending[p.seq]
-        if p.token is not None:
-            by_token.pop(p.token, None)
-
-        r = p.report
-        if r is None:
-            done.append(Result(p.seq, LOST, p.sent_unix_ns, tx_ns=p.tx_ns or 0))
-        elif not p.tx_ns:
-            done.append(Result(p.seq, NO_TX_TS, p.sent_unix_ns, rx_ns=r.rx_ns))
-        elif r.rx_ns == 0 or bool(r.flags & packets.FLAG_HW) != self.hw:
-            done.append(Result(p.seq, NO_RX_TS, p.sent_unix_ns, tx_ns=p.tx_ns))
-        else:
-            rtt = p.report_arrival_ns - p.tx_ns if p.report_arrival_ns else None
-            done.append(
-                Result(p.seq, OK, p.sent_unix_ns, p.tx_ns, r.rx_ns, r.rx_ns - p.tx_ns, rtt)
-            )
 
 
 def summarize(results: Iterable[Result]) -> dict:
@@ -268,11 +319,16 @@ def summarize(results: Iterable[Result]) -> dict:
     return summary
 
 
+# --- Reflecting probes ---------------------------------------------------------------------
+
+
 class Reflector:
     """Answers probes with a report carrying the probe's RX timestamp.
 
     Listens on one or more sockets (by default all IPv4 and IPv6 addresses).
-    Reports go back to the probe's source address and port.
+    Reports go back to the probe's source address and port. Use ``serve()`` for
+    a standalone loop, or register ``socks`` in your own selector and call
+    ``handle_readable(sock)`` (the daemon does this).
     """
 
     def __init__(self, binds: List[Tuple[int, tuple]], ifaces: Iterable[str] = ()) -> None:
@@ -304,11 +360,12 @@ class Reflector:
         try:
             while stop is None or not stop.is_set():
                 for key, _ in sel.select(0.5):
-                    self._drain(key.data, on_probe)
+                    self.handle_readable(key.data, on_probe)
         finally:
             sel.close()
 
-    def _drain(self, s: TimestampedSocket, on_probe) -> None:
+    def handle_readable(self, s: TimestampedSocket, on_probe=None) -> None:
+        """Answer every probe waiting on ``s``."""
         while True:
             item = s.recv()
             if item is None:
@@ -327,3 +384,23 @@ class Reflector:
                 continue
             if on_probe:
                 on_probe(addr, msg, rx_ns)
+
+
+def default_listen(port: int) -> List[Tuple[int, tuple]]:
+    """Wildcard binds on ``port`` for IPv4 and, if available, IPv6."""
+    binds = [(socket.AF_INET, ("0.0.0.0", port))]
+    if socket.has_ipv6:
+        binds.append((socket.AF_INET6, ("::", port, 0, 0)))
+    return binds
+
+
+def open_reflector(binds: List[Tuple[int, tuple]], ifaces: Iterable[str], *, defaulted: bool) -> Reflector:
+    """Open a Reflector; if the default binds were used and IPv6 is unavailable, fall back to IPv4."""
+    ifaces = list(ifaces)
+    try:
+        return Reflector(binds, ifaces)
+    except OSError as e:
+        if defaulted and e.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+            return Reflector(binds[:1], ifaces)
+        port = binds[0][1][1]
+        raise SetupError(f"cannot listen on port {port}: {e.strerror}") from None

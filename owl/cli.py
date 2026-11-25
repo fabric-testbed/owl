@@ -1,9 +1,8 @@
-"""Command-line entry point: `owl ping` and `owl reflect`."""
+"""Command-line entry point: `owl ping`, `owl reflect` and `owl daemon`."""
 
 from __future__ import annotations
 
 import argparse
-import errno
 import json
 import signal
 import socket
@@ -11,6 +10,7 @@ import sys
 from typing import List, Optional, Tuple
 
 from . import __version__, packets
+from .daemon import Daemon, load_config
 from .ping import (
     DEFAULT_PORT,
     LOST,
@@ -19,12 +19,14 @@ from .ping import (
     OK,
     SEND_FAILED,
     Pinger,
-    Reflector,
     Result,
     SetupError,
+    default_listen,
+    open_reflector,
     resolve,
     summarize,
 )
+from .sinks import make_sink
 from .sockets import iface_for_addr
 
 
@@ -106,6 +108,20 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--no-hw", action="store_true", help="don't change NIC timestamp settings (software timestamps only)")
     r.add_argument("-v", "--verbose", action="store_true", help="print each probe answered")
     r.set_defaults(func=cmd_reflect)
+
+    d = sub.add_parser(
+        "daemon",
+        help="probe a list of peers continuously and answer their probes",
+        description=(
+            "Run as a long-lived service: reflect probes on the listen port, probe every peer in "
+            "the config at a fixed interval, and write one record per probe (plus periodic stats) "
+            "to the configured sinks. Counters are logged to stderr. See owl/daemon.py for the "
+            "config format."
+        ),
+    )
+    d.add_argument("-c", "--config", required=True, help="JSON config file")
+    d.add_argument("--check", action="store_true", help="validate the config and exit without opening sockets")
+    d.set_defaults(func=cmd_daemon)
     return parser
 
 
@@ -213,22 +229,13 @@ def _reflect_binds(args) -> Tuple[List[Tuple[int, tuple]], List[str]]:
                 if iface and iface not in ifaces:
                     ifaces.append(iface)
     else:
-        binds.append((socket.AF_INET, ("0.0.0.0", args.port)))
-        if socket.has_ipv6:
-            binds.append((socket.AF_INET6, ("::", args.port, 0, 0)))
+        binds = default_listen(args.port)
     return binds, ifaces
 
 
 def cmd_reflect(args) -> int:
     binds, ifaces = _reflect_binds(args)
-    try:
-        reflector = Reflector(binds, ifaces)
-    except OSError as e:
-        # IPv6 may be disabled on the host; carry on with IPv4 only if that was the default
-        if not args.bind and e.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
-            reflector = Reflector(binds[:1], ifaces)
-        else:
-            raise SetupError(f"cannot listen on port {args.port}: {e.strerror}") from None
+    reflector = open_reflector(binds, ifaces, defaulted=not args.bind)
 
     where = ", ".join(f"[{s.sockname[0]}]:{s.sockname[1]}" for s in reflector.socks)
     hw = f"hardware timestamps on {', '.join(ifaces)}" if ifaces else "software timestamps only"
@@ -246,6 +253,34 @@ def cmd_reflect(args) -> int:
     finally:
         reflector.close()
     print(f"\n{reflector.probes} probes answered, {reflector.errors} send errors")
+    return 0
+
+
+# --- owl daemon ---------------------------------------------------------------------
+
+
+def cmd_daemon(args) -> int:
+    cfg = load_config(args.config)
+    if args.check:
+        print(f"{args.config}: OK (label {cfg.label}, {len(cfg.peers)} peers, clock {cfg.clock}, "
+              f"interval {cfg.interval:g} s)")
+        return 0
+    sinks = []
+    try:
+        for spec in cfg.sinks:
+            sinks.append(make_sink(spec))
+    except OSError as e:
+        raise SetupError(f"cannot open sink {spec}: {e.strerror}") from None
+    daemon = Daemon(cfg, sinks)
+    daemon.log(f"owl {__version__} started: {daemon.describe()}")
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        daemon.log_stats()
+        daemon.close()
+    daemon.log("stopped")
     return 0
 
 

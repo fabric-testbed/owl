@@ -1,0 +1,13 @@
+{
+  "label": "STAR",
+  "peers": [
+    {"addr": "10.140.135.2", "label": "PSC"},
+    {"addr": "10.132.139.2", "label": "CLEM"},
+    {"addr": "2602:fcfb:9:19::2", "label": "CLEM"}
+  ],
+  "clock": "hw",
+  "interval": 5.0,
+  "timeout": 2.0,
+  "stats_interval": 60.0,
+  "sinks": [{"type": "jsonl", "path": "/var/log/owl/owl.jsonl"}]
+}
