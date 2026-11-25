@@ -49,6 +49,7 @@ dev/             # FABRIC validation notebooks (not part of the package), e.g. t
 - **Pinger** keeps each probe pending until it has both the TX timestamp and the report (either order), or the timeout expires. Statuses: `ok`, `lost`, `no_tx_ts`, `no_rx_ts`, `send_failed`.
 - **Reflector** replies to the probe's source address/port, and returns the timestamp kind the probe asked for (`FLAG_HW`) — `rx_ns=0` if unavailable, never a substitute.
 - **session** (random u32 per sender run) filters stale or foreign reports.
+- **`--clock sw`** TX timestamps are `SOF_TIMESTAMPING_TX_SCHED` (taken at queueing, works on every driver), not `TX_SOFTWARE`, which ConnectX VFs on FABRIC never produce.
 - **`--clock hw`** calls `SIOCSHWTSTAMP` (TX on, RX filter ALL) — NIC-wide, needs `CAP_NET_ADMIN`. HW timestamps are in the NIC's PHC timebase (often TAI); SW timestamps are CLOCK_REALTIME. Never mix.
 - Default port **49005**. `owl ping` uses an ephemeral source port.
 - SIGTERM is treated like Ctrl-C (clean shutdown with summary).

@@ -1,7 +1,7 @@
 # owl2 — Architecture & Implementation Plan
 
 **Created:** 2026-11-24
-**Last updated:** 2026-11-24 (FABRIC two-node test results)
+**Last updated:** 2026-11-25 (second FABRIC run; sw mode uses TX_SCHED)
 
 This document supersedes `.claude/owl-redesign-plan.md` (2026-04) as the top-level plan. That file is still the detailed reference for the measurement core (socket setup, event loop, `MSG_ERRQUEUE` handling, hardware-timestamp filter). owl2 keeps that core and changes everything around it. Where the two conflict, this file wins.
 
@@ -201,10 +201,32 @@ Run with `dev/fabric_two_node_test.ipynb`.
 - **IPv4 routing is asymmetric:** the two directions differ by 8.2 ms. That is real (the clocks are proven consistent), and it is exactly what RTT/2 hides.
 - **Jitter:** average − min is 13–37 µs.
 
-**`--clock sw`: broken on these VMs.**
+**`--clock sw`: broken on these VMs (fixed 2026-11-25, see below).**
 - `mlx5_core` on 5.15 produces no software TX timestamps; `ethtool -T` lists only `hardware-*` capabilities. Loopback works on the same VM, and running as root makes no difference.
 - Every sw run is `no_tx_ts`.
-- To check: whether `SOF_TIMESTAMPING_TX_SCHED`, taken by the kernel when the packet is queued and independent of the driver, works there. If so, sw mode can fall back to it.
+
+### Second FABRIC run (2026-11-25): CLEM ↔ NCSA
+
+Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that sends one packet per timestamp kind from each VM.
+
+**TX timestamp kinds on `mlx5_core` VFs** (both VMs, IPv4 and IPv6 alike):
+
+| flags | to the FABNet peer | to loopback |
+|---|---|---|
+| `TX_SOFTWARE` (with or without OPT_ID) | nothing | SND |
+| `TX_HARDWARE` | SND, hw time | nothing |
+| `TX_SCHED` | SCHED, sw time | SCHED |
+
+**Decision: `--clock sw` now uses `TX_SCHED` everywhere, not `TX_SOFTWARE`.**
+- It is taken in `__dev_queue_xmit()` for every device, so sw mode means the same thing on every driver.
+- It gives one error-queue entry per packet, so OPT_ID matching is unchanged.
+- It is earlier than the driver's timestamp by the time spent in the qdisc and driver, usually a few µs. That is small next to the sw RX timestamp's own interrupt and softirq latency.
+- Preferring SND and falling back to SCHED was rejected: a run could mix the two kinds, and matching would have to wait for a second entry that may never come.
+
+**PTP failed on one VM (owl-a at CLEM)**, even though FABRIC lists CLEM as PTP-capable.
+- `phc2sys@*` inactive, `/dev/ptp_kvm` present: the system clock was 0.9 ms off `ptp_kvm` and drifting 6.6 ppm, and the NIC PHC was 0.88 s off and drifting 10.5 ppm. The cause is not known yet.
+- The hw runs still completed: A→B 903.93 ms, B→A −858.55 ms. The verdict said BROKEN. The apparent offset (881.24 ms) matches the clock check's PHC offset (0.8815 s), and sum vs rtt still agreed (turnaround 0.28 ms), because the offset cancels in the sum. That validates both the clock check and the verdict logic.
+- `ptp_capable` therefore does not guarantee working PTP on a given VM. The notebook now prints the `phc2sys` status, journal and playbook errors when the service isn't running, and warns before measuring. The Phase 3 slice manager must check the clocks itself and treat a failed site as down.
 
 **Consequences for later phases:**
 - **`--clock hw` stays the default and is the FABRIC mode.** Its timebase there is UTC.
@@ -227,7 +249,8 @@ Run with `dev/fabric_two_node_test.ipynb`.
 - [x] `sockets.py`: v4/v6 `TimestampedSocket` with OPT_ID TX tokens, `SIOCSHWTSTAMP`, interface lookup via `ip -j addr` (2026-11-24)
 - [x] `owl ping` (per-probe output, summary, `--json`) and `owl reflect`. Loopback tests pass with software timestamps on Linux, Python 3.9, IPv4 and IPv6 (2026-11-24)
 - [x] Two-node hardware test on FABRIC, over FABNetv4 and FABNetv6. Notebook: `dev/fabric_two_node_test.ipynb`. **hw passes; sw has no TX timestamps on mlx5 VFs.** See "FABRIC two-node hardware test results" (2026-11-24).
-- [ ] `--clock sw` on drivers without software TX timestamps: fall back to `SOF_TIMESTAMPING_TX_SCHED` if the diagnostic shows it works on FABRIC. Otherwise print a clear error after the first `no_tx_ts` instead of 50 of them.
+- [x] `--clock sw` on drivers without software TX timestamps: sw mode uses `SOF_TIMESTAMPING_TX_SCHED`, which works on FABRIC's mlx5 VFs. See "Second FABRIC run" (2026-11-25)
+- [ ] Rerun the two-node test with PTP working on both VMs to confirm `--clock sw` end to end on FABRIC
 
 ### Phase 2: owl daemon (this repo)
 - [ ] JSON config with labels; the daemon event loop; counters

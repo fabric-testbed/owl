@@ -25,6 +25,7 @@ SOF_TIMESTAMPING_RX_SOFTWARE = 1 << 3
 SOF_TIMESTAMPING_SOFTWARE = 1 << 4
 SOF_TIMESTAMPING_RAW_HARDWARE = 1 << 6
 SOF_TIMESTAMPING_OPT_ID = 1 << 7
+SOF_TIMESTAMPING_TX_SCHED = 1 << 8
 SOF_TIMESTAMPING_OPT_TSONLY = 1 << 11
 
 HWTSTAMP_TX_ON = 1
@@ -143,7 +144,15 @@ class TimestampedSocket:
     returns the same token, so timestamps can be matched to packets regardless
     of the order they come back in.
 
-    ``hw`` selects which TX timestamp is generated: raw hardware or software.
+    ``hw`` selects which TX timestamp is generated: raw hardware, or software.
+    The software one is SOF_TIMESTAMPING_TX_SCHED, taken by the kernel as the
+    packet enters the device's queue, not TX_SOFTWARE, taken by the driver
+    just before the NIC sends it. TX_SOFTWARE depends on the driver calling
+    skb_tx_timestamp(), and some don't: ConnectX VFs (mlx5_core) on FABRIC
+    never produce it. TX_SCHED works on every device, so sw mode means the
+    same thing everywhere. It is earlier by the time spent in the qdisc and
+    driver, usually a few µs, which is small next to the software RX timestamp's
+    own interrupt and softirq latency.
     """
 
     def __init__(
@@ -158,7 +167,7 @@ class TimestampedSocket:
         self._tx_flags = 0
         if tx_timestamps:
             self._tx_flags = (
-                (SOF_TIMESTAMPING_TX_HARDWARE if hw else SOF_TIMESTAMPING_TX_SOFTWARE)
+                (SOF_TIMESTAMPING_TX_HARDWARE if hw else SOF_TIMESTAMPING_TX_SCHED)
                 | SOF_TIMESTAMPING_OPT_ID
                 | SOF_TIMESTAMPING_OPT_TSONLY  # don't loop the payload back with the timestamp
             )

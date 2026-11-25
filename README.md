@@ -102,7 +102,7 @@ answers with "no timestamp" rather than substituting a software time.
 
 | | `--clock hw` | `--clock sw` |
 |---|---|---|
-| Where the time is taken | in the NIC as the packet crosses the wire | in the kernel network stack |
+| Where the time is taken | in the NIC as the packet crosses the wire | in the kernel: TX as the packet is queued to the device, RX as it enters the stack |
 | Clock | the NIC's PTP hardware clock (often TAI) | `CLOCK_REALTIME` (UTC) |
 | Typical accuracy | tens of ns | a few µs |
 | Needs | NIC support + root/`CAP_NET_ADMIN` | nothing |
