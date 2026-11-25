@@ -230,7 +230,7 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
 
 **Consequences for later phases:**
 - **`--clock hw` stays the default and is the FABRIC mode.** Its timebase there is UTC.
-- **Clock-health guard (Phase 2):** compare each dataplane NIC's PHC with `CLOCK_REALTIME`, the method the notebook uses, which should agree within a few µs. Mark samples `ptp_ok=false` otherwise. Losing `phc2sys@<iface>` silently corrupts hw data, and that was the first failure seen here.
+- **Clock-health guard (Phase 2):** judge each dataplane NIC's PHC and `CLOCK_REALTIME` against `/dev/ptp_kvm` when it exists (against each other otherwise), as the notebook's clock check does since 2026-11-25. Offsets should be within a few µs and drift under 1 ppm (drift over 5 s is noise below ~0.2 ppm). Mark samples `ptp_ok=false` otherwise. Losing `phc2sys@<iface>` silently corrupts hw data, and that was the first failure seen here.
 - **Slice manager (Phase 3):** must verify that `phc2sys@CLOCK_REALTIME` *and* `phc2sys@<dataplane iface>` are active.
 - **Don't install Ubuntu's `linuxptp` package before the playbook.** The playbook then skips installing gcc/make, its linuxptp 4.4 build fails, and no `phc2sys` units are created.
 - **FABlib pitfall:** `node.execute(timeout=N)` runs `sudo timeout N <cmd>`, which breaks commands that start with a shell builtin such as `cd`.

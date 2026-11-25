@@ -134,7 +134,7 @@ The danger is mixing the two timescales, which shows up as an error of about 37 
 |---|---|---|---|---|
 | 11-24, first try, UCSD ↔ TOKY | **none**: Ubuntu's `linuxptp` package broke the playbook | — | 0.3–0.7 s, 1.7–5.8 ppm | not usable |
 | 11-24, fixed, UCSD ↔ TOKY | all running | 0.40–0.53 µs | 0.42–0.65 µs, < 0.06 ppm | hw: 50/50 every run. IPv6 directions agree to 0.2 µs. IPv4 shows a real 8.2 ms route asymmetry. sw: no TX stamps. |
-| 11-25, NCSA side | all running | 0.46 µs | 0.56–0.59 µs | healthy |
+| 11-25, NCSA side | all running | 0.46 µs | 0.56–0.59 µs (0.10–0.14 µs against `ptp_kvm`) | healthy |
 | 11-25, CLEM side | **not running** (cause not yet known) | 0.89 ms, 6.6 ppm | 0.88 s, 10.5 ppm | hw: 903.93 ms one way, −858.55 ms the other. Verdict: BROKEN. |
 
 The CLEM run is useful as a deliberate-looking failure:
@@ -142,14 +142,14 @@ The CLEM run is useful as a deliberate-looking failure:
 - The apparent offset from the latencies, (903.93 + 858.55) / 2 = **881.24 ms**, matches the clock check's independent reading of CLEM's VF clock, **881.45 ms**. The latency data and the clock check agree about what went wrong.
 - The sum (45.38 ms) still sat just under the RTT (45.66 ms), because the offset cancels. The timestamps themselves were fine. Only the clock was wrong.
 
-> **How precise are the clock-check numbers?** Each offset is measured by reading the system clock, then the other clock, then the system clock again, and keeping the tightest of 300 tries. Reading a NIC clock crosses PCIe and takes around a microsecond, so sub-µs offsets are upper bounds rather than exact values. The strongest end-to-end evidence is run 1's IPv6 result: the two directions over a 62.5 ms path agreed to 0.2 µs.
+> **How precise are the clock-check numbers?** Each offset is measured by reading the reference clock, then the other clock, then the reference again, and keeping the tightest of 300 tries. Drift comes from two such readings 5 s apart, so drifts below about 0.2 ppm are noise; the notebook calls a clock drifting above 1 ppm (unsteered clocks drifted 1.7–10.5 ppm). Reading a NIC clock crosses PCIe and takes around a microsecond, so sub-µs offsets are upper bounds rather than exact values. The strongest end-to-end evidence is run 1's IPv6 result: the two directions over a 62.5 ms path agreed to 0.2 µs.
 
 ## 7. What can still go wrong, and what catches it
 
 | Failure | Effect | Caught by the notebook today | Caught by owl2 (planned) |
 |---|---|---|---|
 | `phc2sys@<iface>` not running | hw off by up to ~1 s, drifting | yes (clock check) | yes (`ptp_ok` guard, Phase 2) |
-| `phc2sys@CLOCK_REALTIME` not running | sw off by ms, drifting | partly: also wrongly flags a healthy VF clock, since it compares the VF clock with the system clock | yes, if the guard compares both with `ptp_kvm` (proposal below) |
+| `phc2sys@CLOCK_REALTIME` not running | sw off by ms, drifting | yes (each clock is judged against `ptp_kvm`, so a healthy VF clock isn't blamed) | yes, if the guard also compares against `ptp_kvm` |
 | `ptp_kvm` module missing (kernel upgraded without `linux-modules-extra`) | neither service can run | yes | yes |
 | **The host itself loses PTP** (grandmaster outage, host `ptp4l` unlocked) | `ptp_kvm` is wrong, and every clock in the VM agrees with it | **no** | **no**: needs a check from outside the VM (see below) |
 | Route asymmetry | indistinguishable from clock offset in the latency data | not an error, but limits what the apparent offset can prove | — |
@@ -165,7 +165,7 @@ The CLEM run is useful as a deliberate-looking failure:
 - **Decided: `--clock hw` is the default and the FABRIC mode.** It needs `phc2sys@<iface>` running in the VM, and its timebase on FABRIC is UTC.
 - **Decided (2026-11-25): `--clock sw` uses `TX_SCHED` on every machine.** It works on every driver, including FABRIC's VFs. Expect sw latencies tens of µs higher and noisier than hw. Use it on hosts without a usable NIC clock.
 - **Decided: owl checks clocks but doesn't manage them.** The Phase 2 `ptp_ok` guard marks samples as untrusted instead of dropping them.
-- **Proposal: compare both VM clocks with `ptp_kvm`** when it exists, rather than with each other, so a broken system clock isn't reported as a broken NIC clock. The notebook already reads all three, so this is a small change.
+- **Decided (2026-11-25): judge both VM clocks against `ptp_kvm`** when it exists, rather than against each other, so a broken system clock isn't reported as a broken NIC clock. The notebook's clock check does this now, and the Phase 2 `ptp_ok` guard will do the same.
 - **Decided: the Phase 3 slice manager verifies every VM itself**: services active and offsets small, and it treats a failing site as down. CLEM shows that the `ptp_capable` flag alone isn't enough.
 - **Open: host-level PTP failures.** Mesh consistency in the dashboard, a coarse NTP check in owl, both, or neither.
 
