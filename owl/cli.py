@@ -9,7 +9,7 @@ import socket
 import sys
 from typing import List, Optional, Tuple
 
-from . import __version__, packets
+from . import packets, version_string
 from .daemon import Daemon, load_config, log_stderr
 from .ping import (
     DEFAULT_PORT,
@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="owl",
         description="One-way latency measurement using kernel and NIC packet timestamps.",
     )
-    parser.add_argument("--version", action="version", version=f"owl {__version__}")
+    parser.add_argument("--version", action="version", version=f"owl {version_string()}")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
@@ -279,7 +279,7 @@ def cmd_daemon(args) -> int:
         for s in sinks:
             s.close()
         raise
-    daemon.log(f"owl {__version__} started: {daemon.describe()}")
+    daemon.log(f"owl {version_string()} started: {daemon.describe()}")
     try:
         daemon.run()
     except KeyboardInterrupt:

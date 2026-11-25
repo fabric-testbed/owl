@@ -1,7 +1,7 @@
 # owl2 — Architecture & Implementation Plan
 
 **Created:** 2026-11-24
-**Last updated:** 2026-11-25 (Phase 2: summaries and clock check)
+**Last updated:** 2026-11-25 (Phase 2: systemd unit and zipapp)
 
 This document supersedes `.claude/owl-redesign-plan.md` (2026-04) as the top-level plan. That file is still the detailed reference for the measurement core (socket setup, event loop, `MSG_ERRQUEUE` handling, hardware-timestamp filter). owl2 keeps that core and changes everything around it. Where the two conflict, this file wins.
 
@@ -269,7 +269,15 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
   - Probe records carry `local_clock_ok`, `remote_clock_ok` and `ptp_ok` (false if either is false, true if both are true, omitted otherwise).
   - This closes the gap that a sender could only vouch for its own clock. Backward compatible, because readers ignore unknown flag bits.
   - `owl ping` prints a note when the reflector reports a bad clock, and `--json` includes `remote_clock_ok`.
-- **Not yet:** config reload (the slice manager restarts the service instead), systemd unit, zipapp.
+- **Packaging:**
+  - `scripts/build_pyz.py` writes `dist/owl.pyz`, about 31 KB. It embeds `owl/_build.py` with the git commit (`+dirty` if `owl/` has uncommitted changes), so `owl --version` and the daemon's startup line say exactly what's deployed; the slice manager can compare that with what it means to deploy.
+  - `contrib/owl.service`:
+    - runs `/usr/bin/python3 /opt/owl/owl.pyz daemon -c /etc/owl/owl.json`, with `--check` as ExecStartPre;
+    - `Restart=on-failure` after 10 s, and `TimeoutStopSec=30` (the http sink may spend about 15 s flushing);
+    - root with `CapabilityBoundingSet=CAP_NET_ADMIN`, `ProtectSystem=strict`, and `LogsDirectory=owl` for jsonl output.
+  - `ProtectClock=` and `PrivateDevices=` are deliberately absent: both restrict device access and would block `/dev/ptp*`. `systemd-analyze security` rates the unit 4.5 (OK).
+- **Tested under systemd 252 (Debian 12 container, 2026-11-25):** `systemd-analyze verify` passes; enable --now starts it after the config check; stats appear in the journal; `systemctl stop` is clean (final summaries written, 28/28 ok); jsonl lands in `/var/log/owl`. A config typo fails the start with the bad key named in the journal, and systemd retries every 10 s.
+- **Not yet:** config reload (the slice manager restarts the service instead). Publishing `owl.pyz` (a GitHub release asset, or the slice manager builds it from a pinned commit) is for Phase 3 to decide.
 
 ## Implementation checklist
 
@@ -292,7 +300,7 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
 - [x] Sinks: stdout/jsonl, `http-lineprotocol` with a bounded retry buffer (2026-11-25). Verified against a real InfluxDB 2.7 with an 8 s outage: all 297 probes stored once, in order
 - [x] Per-peer summaries; clock-health guard (`ptp_ok`), with the peer's verdict carried in report flags (2026-11-25)
 - [ ] Validate the clock check on FABRIC: the notebook's new daemon section (phc_index ioctl on mlx5 VFs, `/dev/ptp_kvm` reads, flags between two VMs; ideally once with a broken-PTP VM)
-- [ ] systemd unit, zipapp build, README
+- [x] systemd unit, zipapp build, README (2026-11-25). Tested under real systemd (Debian 12 container): config check, start, journal, clean stop, bad-config failure
 - [ ] 3-node test with InfluxDB, including an outage test
 
 ### Phase 3: FABRIC service (dashboard repo)

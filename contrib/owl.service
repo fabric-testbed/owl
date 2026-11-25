@@ -1,0 +1,49 @@
+# systemd unit for `owl daemon`.
+#
+# Install (see README "Running as a service"):
+#   /opt/owl/owl.pyz           built with scripts/build_pyz.py
+#   /etc/owl/owl.json          daemon config
+#   /etc/owl/influx-token      if the config uses an http-lineprotocol sink with token_file (mode 0600)
+#
+# Logs and counters go to the journal: journalctl -u owl -f
+
+[Unit]
+Description=OWL one-way latency daemon
+Documentation=https://github.com/fabric-testbed/owl
+Wants=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+# Refuse to start (and say why in the journal) if the config is invalid.
+ExecStartPre=/usr/bin/python3 /opt/owl/owl.pyz daemon -c /etc/owl/owl.json --check
+ExecStart=/usr/bin/python3 /opt/owl/owl.pyz daemon -c /etc/owl/owl.json
+# SIGTERM makes owl write its last summaries and stats, and give the http sink up to ~15 s to deliver.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+
+# Root is needed in hw mode: SIOCSHWTSTAMP needs CAP_NET_ADMIN, and the clock check opens
+# /dev/ptp* and /dev/ptp_kvm, which are root-only. Everything else is locked down.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+# No ProtectClock= or PrivateDevices=: both restrict device access and would block /dev/ptp*.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+# jsonl sinks may write here (owned by root, created by systemd).
+LogsDirectory=owl
+ReadOnlyPaths=/etc/owl
+
+[Install]
+WantedBy=multi-user.target

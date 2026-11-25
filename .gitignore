@@ -6,3 +6,4 @@ owl-venv/
 ***local*
 obsolete/
 .DS_Store
+dist/

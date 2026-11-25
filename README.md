@@ -11,8 +11,8 @@ nothing to install besides Python 3.9+.
 
 > **Status:** owl2 rewrite in progress (branch `owl2`). `owl ping`,
 > `owl reflect` and `owl daemon` (JSON Lines and InfluxDB output, per-peer
-> summaries, clock-health check) work. A systemd unit and a single-file build
-> are next. v1 (Docker + tcpdump +
+> summaries, clock-health check) work, as a single file under systemd. Next is a
+> multi-site test on FABRIC. v1 (Docker + tcpdump +
 > PCAP) is preserved at tag `v1-final`.
 
 ## Requirements
@@ -38,7 +38,14 @@ pipx install git+https://github.com/fabric-testbed/owl@owl2
 
 # or run without installing
 python3 -m owl --help
+
+# or build a single file that runs anywhere with Python 3.9+, nothing to install
+python3 scripts/build_pyz.py          # writes dist/owl.pyz
+python3 dist/owl.pyz --version        # owl 2.0.0.dev0 (git 4faa3b1)
 ```
+
+`owl.pyz` records the git commit it was built from, with `+dirty` if `owl/` had
+uncommitted changes, so `--version` on a host shows exactly what is deployed.
 
 ## Quick start
 
@@ -214,6 +221,31 @@ dropped and counted. A 4xx response other than 429 (for example a bad token) mea
 retrying can't help: that batch is dropped and the error is logged. The stats
 records count drops (`sink_dropped`), the backlog (`sink_buffered`) and failed
 attempts (`sink_failed_posts`).
+
+### Running as a service
+
+[`contrib/owl.service`](contrib/owl.service) runs the single-file build under systemd:
+
+```bash
+python3 scripts/build_pyz.py
+sudo install -D -m 0644 dist/owl.pyz /opt/owl/owl.pyz
+sudo install -D -m 0640 my-config.json /etc/owl/owl.json
+sudo install -D -m 0600 my-token /etc/owl/influx-token    # only for an http-lineprotocol sink with token_file
+sudo install -m 0644 contrib/owl.service /etc/systemd/system/owl.service
+sudo systemctl daemon-reload && sudo systemctl enable --now owl
+journalctl -u owl -f                                     # startup line, clock check, stats every stats_interval
+```
+
+- **Config check:** the unit runs `owl daemon --check` before every start. An invalid config
+  fails the start, and `journalctl -u owl` says which key is wrong.
+- **Restarts:** systemd restarts the daemon 10 s after a failure.
+- **Stopping:** `systemctl stop owl` writes the final summaries and stats first.
+- **Output:** jsonl sinks can write under `/var/log/owl/`, which systemd creates.
+- **Privileges:** it runs as root because hw mode needs `CAP_NET_ADMIN` and the clock check
+  reads the root-only `/dev/ptp*` devices. It is otherwise sandboxed: no other capabilities,
+  a read-only filesystem except `/var/log/owl`, and no home directories.
+- **Updating:** replace `/opt/owl/owl.pyz` and `systemctl restart owl`. To change the config,
+  edit `/etc/owl/owl.json` and restart; there is no reload.
 
 ## Hardware vs software timestamps
 

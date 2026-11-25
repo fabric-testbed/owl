@@ -19,6 +19,7 @@ Hard constraints: **Linux only, Python ≥ 3.9, standard library only** (no thir
 ```bash
 pip install .                      # installs the `owl` console script
 python3 -m owl ping --help         # or run without installing
+python3 scripts/build_pyz.py       # single-file build: dist/owl.pyz (embeds the git commit; `--version` shows it)
 
 # Tests: packets tests run anywhere; loopback tests need Linux.
 python3 -m unittest discover -s tests -v
@@ -41,8 +42,10 @@ owl/
 ├── sinks.py     # record sinks: JsonlSink, HttpLineProtocolSink (background sender thread, bounded buffer, retry/backoff), to_line_protocol(), validate_spec()/make_sink()
 ├── cli.py       # argparse: `owl ping`, `owl reflect`, `owl daemon`
 └── __main__.py  # python -m owl
-tests/           # unittest: test_packets.py, test_config.py, test_sinks.py, test_clockcheck.py (portable); test_loopback.py, test_daemon.py (Linux)
+tests/           # unittest: test_packets.py, test_config.py, test_sinks.py, test_clockcheck.py, test_build.py (portable); test_loopback.py, test_daemon.py (Linux)
 examples/        # owl-daemon.json example config
+scripts/         # build_pyz.py: zipapp build
+contrib/         # owl.service: hardened systemd unit (runs /opt/owl/owl.pyz with /etc/owl/owl.json; no ProtectClock/PrivateDevices, they'd block /dev/ptp*)
 docs/            # clock-chain.md: which clocks a measurement depends on (FABRIC host/ptp_kvm/VF PHC), failure modes, test results; keep it current when clock handling changes
 dev/             # FABRIC validation notebooks (not part of the package), e.g. the two-node hw test
 ```
