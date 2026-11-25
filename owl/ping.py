@@ -56,6 +56,14 @@ class Result(NamedTuple):
     owl_ns: Optional[int] = None
     rtt_ns: Optional[int] = None
     error: str = ""
+    # The reflector's own clock check, from its report: None = it doesn't check (or no report).
+    remote_clock_ok: Optional[bool] = None
+
+
+def remote_clock_ok(flags: int) -> Optional[bool]:
+    if not flags & packets.FLAG_CLOCK_CHECKED:
+        return None
+    return not flags & packets.FLAG_CLOCK_BAD
 
 
 def resolve(host: str, port: int, family: int = 0) -> Tuple[int, tuple]:
@@ -206,13 +214,16 @@ class ProbeEngine:
         r = p.report
         if r is None:
             result = Result(p.seq, LOST, p.sent_unix_ns, tx_ns=p.tx_ns or 0)
-        elif not p.tx_ns:
-            result = Result(p.seq, NO_TX_TS, p.sent_unix_ns, rx_ns=r.rx_ns)
-        elif r.rx_ns == 0 or bool(r.flags & packets.FLAG_HW) != self.hw:
-            result = Result(p.seq, NO_RX_TS, p.sent_unix_ns, tx_ns=p.tx_ns)
         else:
-            rtt = p.report_arrival_ns - p.tx_ns if p.report_arrival_ns else None
-            result = Result(p.seq, OK, p.sent_unix_ns, p.tx_ns, r.rx_ns, r.rx_ns - p.tx_ns, rtt)
+            remote = remote_clock_ok(r.flags)
+            if not p.tx_ns:
+                result = Result(p.seq, NO_TX_TS, p.sent_unix_ns, rx_ns=r.rx_ns, remote_clock_ok=remote)
+            elif r.rx_ns == 0 or bool(r.flags & packets.FLAG_HW) != self.hw:
+                result = Result(p.seq, NO_RX_TS, p.sent_unix_ns, tx_ns=p.tx_ns, remote_clock_ok=remote)
+            else:
+                rtt = p.report_arrival_ns - p.tx_ns if p.report_arrival_ns else None
+                result = Result(p.seq, OK, p.sent_unix_ns, p.tx_ns, r.rx_ns, r.rx_ns - p.tx_ns, rtt,
+                                remote_clock_ok=remote)
         done.append((p.target, result))
 
 
@@ -343,6 +354,8 @@ class Reflector:
             raise
         self.probes = 0
         self.errors = 0
+        # OR'd into every report: FLAG_CLOCK_CHECKED [| FLAG_CLOCK_BAD], set by the daemon's clock check.
+        self.clock_flags = 0
 
     def close(self) -> None:
         for s in self.socks:
@@ -378,7 +391,8 @@ class Reflector:
             rx_ns = 0 if ts is None else (ts.hw_ns if want_hw else ts.sw_ns)
             self.probes += 1
             try:
-                s.send(packets.pack_report(msg.session, msg.seq, msg.flags & packets.FLAG_HW, rx_ns), addr)
+                flags = (msg.flags & packets.FLAG_HW) | self.clock_flags
+                s.send(packets.pack_report(msg.session, msg.seq, flags, rx_ns), addr)
             except OSError:
                 self.errors += 1
                 continue

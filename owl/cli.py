@@ -139,6 +139,8 @@ def _describe(r: Result, args, hw_hint_shown: List[bool]) -> str:
             line += f" rtt={_ms(r.rtt_ns)} ms"
         if r.owl_ns < 0:
             line += "  [negative: are both clocks PTP-synchronized?]"
+        if r.remote_clock_ok is False:
+            line += "  [reflector reports its clock is not synchronized]"
         return line
     if r.status == LOST:
         return f"seq={r.seq} lost (no report within {args.timeout:g} s)"
@@ -283,6 +285,7 @@ def cmd_daemon(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        daemon.emit_summaries(final=True)
         daemon.log_stats()
         daemon.close()
     daemon.log("stopped")

@@ -117,6 +117,72 @@ class TestDaemonLoopback(unittest.TestCase):
         self.assertEqual(by.get("lo4"), {ping.OK})
         self.assertEqual(by.get("nobody"), {ping.LOST})
 
+    def test_summaries(self):
+        daemon, sink, _ = self.make(summary_interval=0.25, timeout=0.2)
+        try:
+            self.run_for(daemon, 1.2)
+            daemon.emit_summaries(final=True)
+        finally:
+            daemon.close()
+        probes = [r for r in sink.records if r["type"] == "probe"]
+        sums = [r for r in sink.records if r["type"] == "summary"]
+        for label in ("lo4", "lo6"):
+            mine = [r for r in sums if r["dst_label"] == label]
+            self.assertGreaterEqual(len(mine), 3, label)
+            self.assertEqual(sum(r["sent"] for r in mine), sum(1 for p in probes if p["dst_label"] == label),
+                             "every probe counted in exactly one window")
+            for r in mine:
+                self.assertEqual(r["time_ns"] % 250_000_000, 0, "windows align to the wall clock")
+                self.assertEqual((r["ok"], r["lost"], r["invalid"]), (r["sent"], 0, 0))
+                self.assertLessEqual(r["owl_min_ns"], r["owl_p50_ns"])
+                self.assertLessEqual(r["owl_p50_ns"], r["owl_max_ns"])
+                self.assertEqual(r["ptp_bad"], 0)
+                self.assertNotIn("ptp_ok", r, "no clock check here, so unknown")
+        times = [r["time_ns"] for r in sums]
+        self.assertEqual(times, sorted(times))
+
+    def test_clock_state_reaches_records_and_peers(self):
+        """Our clock check's verdict is in our records and, via report flags, in whoever probes us."""
+
+        class FakeGuard:
+            def __init__(self, ok):
+                self.ok = ok
+
+            def check(self):
+                return self.ok
+
+            def worst_offset_ns(self):
+                return 5_000 if self.ok else 881_000_000
+
+            def describe(self):
+                return "fake"
+
+            def close(self):
+                pass
+
+        for ok in (False, True):
+            with self.subTest(clock_ok=ok):
+                daemon, sink, _ = self.make(summary_interval=0.25, timeout=0.2)
+                daemon.guard.close()
+                daemon.guard = FakeGuard(ok)
+                try:
+                    self.run_for(daemon, 0.6)
+                    daemon.emit_summaries(final=True)
+                    daemon.log_stats()
+                finally:
+                    daemon.close()
+                probes = [r for r in sink.records if r["type"] == "probe"]
+                self.assertTrue(probes)
+                for r in probes:
+                    # the daemon probes itself, so local and remote are the same clock
+                    self.assertEqual((r["local_clock_ok"], r["remote_clock_ok"], r["ptp_ok"]), (ok, ok, ok), r)
+                    self.assertEqual(r["status"], ping.OK, "a bad clock flags data, it doesn't drop it")
+                sums = [r for r in sink.records if r["type"] == "summary"]
+                self.assertTrue(sums and all(r["ptp_ok"] is ok for r in sums))
+                self.assertEqual(sum(r["ptp_bad"] for r in sums), 0 if ok else len(probes))
+                stats = [r for r in sink.records if r["type"] == "stats"][-1]
+                self.assertEqual((stats["clock_ok"], stats["clock_offset_ns"]), (ok, 5_000 if ok else 881_000_000))
+
     def test_http_sink_wiring(self):
         """Probe records reach an HTTP sink as line protocol; a stats-only sink gets only stats."""
         from test_sinks import _Server, wait_for

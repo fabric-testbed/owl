@@ -1,7 +1,7 @@
 # owl2 — Architecture & Implementation Plan
 
 **Created:** 2026-11-24
-**Last updated:** 2026-11-25 (Phase 2 started: daemon, config, jsonl sink)
+**Last updated:** 2026-11-25 (Phase 2: summaries and clock check)
 
 This document supersedes `.claude/owl-redesign-plan.md` (2026-04) as the top-level plan. That file is still the detailed reference for the measurement core (socket setup, event loop, `MSG_ERRQUEUE` handling, hardware-timestamp filter). owl2 keeps that core and changes everything around it. Where the two conflict, this file wins.
 
@@ -254,7 +254,22 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
   - When full, the buffer drops the oldest lines. `close()` spends up to 5 s delivering what is left.
   - Sinks take `records: [...]` to receive only probes or only stats.
 - **Verified against InfluxDB 2.7 in Docker (2026-11-25):** daemon at 0.2 s interval with two peers over IPv4 and IPv6, InfluxDB stopped from about 6 s to 14 s. Measurement was unaffected (297/297 ok). Delivery resumed 15 s after the first failure, and InfluxDB held 149 + 148 = 297 probe points exactly once, plus 15 stats points. Labels with spaces were escaped correctly.
-- **Not yet:** summaries, the `ptp_ok` guard, config reload (the slice manager restarts the service instead).
+- **Summaries:**
+  - Windows of `summary_interval` (default 60 s) aligned to the wall clock, keyed by each probe's send time.
+  - A window is emitted once no more results can arrive (window end + timeout + 1 s). Shutdown emits the partial windows.
+  - Fields: `sent, ok, lost (incl. send_failed), invalid, owl_{min,p50,mean,max,stddev}_ns, rtt_{min,p50}_ns, ptp_bad`, and `ptp_ok` when any probe's clock state was known.
+  - Latency statistics include bad-clock probes; `ptp_ok`/`ptp_bad` let the dashboard grey them out instead of hiding them.
+  - Measurement `owl_summary`; sinks can take `records: ["summary"]` to send them to their own bucket.
+- **Clock check (`clockcheck.py`, `ClockGuard`):**
+  - The reference is `/dev/ptp_kvm` if present, else the system clock (hw only).
+  - Checked: the PHC of each probing NIC in hw mode (index via the `ETHTOOL_GET_TS_INFO` ioctl, no `ethtool` binary), or the system clock in sw mode.
+  - Tightest of 100 ref/clock/ref triples every `clock_check_interval` (10 s). Healthy within `clock_max_offset_us` (10 µs) of 0 or of 37 s (a TAI NIC clock).
+  - Without a reference, for example sw mode on a host without `ptp_kvm`, the check is disabled and state stays unknown.
+- **Remote clock state (new report flags):** `FLAG_CLOCK_CHECKED` (0x02) and `FLAG_CLOCK_BAD` (0x04) in reports. The daemon's reflector sets them from its own check. `owl reflect` sets neither, so its state is "unknown".
+  - Probe records carry `local_clock_ok`, `remote_clock_ok` and `ptp_ok` (false if either is false, true if both are true, omitted otherwise).
+  - This closes the gap that a sender could only vouch for its own clock. Backward compatible, because readers ignore unknown flag bits.
+  - `owl ping` prints a note when the reflector reports a bad clock, and `--json` includes `remote_clock_ok`.
+- **Not yet:** config reload (the slice manager restarts the service instead), systemd unit, zipapp.
 
 ## Implementation checklist
 
@@ -275,7 +290,8 @@ Same notebook and image, owl at `0a61f76`, plus a TX timestamp diagnostic that s
 ### Phase 2: owl daemon (this repo)
 - [x] JSON config with labels; the daemon event loop; counters; `jsonl` sink (2026-11-25). See "Phase 2 implementation notes"
 - [x] Sinks: stdout/jsonl, `http-lineprotocol` with a bounded retry buffer (2026-11-25). Verified against a real InfluxDB 2.7 with an 8 s outage: all 297 probes stored once, in order
-- [ ] Per-peer summaries; clock-health guard (`ptp_ok`)
+- [x] Per-peer summaries; clock-health guard (`ptp_ok`), with the peer's verdict carried in report flags (2026-11-25)
+- [ ] Validate the clock check on FABRIC: the notebook's new daemon section (phc_index ioctl on mlx5 VFs, `/dev/ptp_kvm` reads, flags between two VMs; ideally once with a broken-PTP VM)
 - [ ] systemd unit, zipapp build, README
 - [ ] 3-node test with InfluxDB, including an outage test
 

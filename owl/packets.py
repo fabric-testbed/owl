@@ -16,6 +16,13 @@ flags:
                       (otherwise the kernel software timestamp, CLOCK_REALTIME).
               report: rx_ns is a hardware timestamp. rx_ns == 0 means the
                       reflector had no timestamp of the requested kind.
+    FLAG_CLOCK_CHECKED
+              report: the reflector checks its own clock's synchronization
+                      (owl daemon's clock check); FLAG_CLOCK_BAD is meaningful.
+    FLAG_CLOCK_BAD
+              report: at the reflector's last check, the clock its rx_ns comes
+                      from was not synchronized, so this probe's latency is suspect.
+              A reflector that doesn't check (owl reflect) sets neither.
 
 session is a random value chosen by each sender run, so reports left over from
 an earlier run (or another sender sharing the port) are never mistaken for ours.
@@ -36,6 +43,8 @@ PROBE = 1
 REPORT = 2
 
 FLAG_HW = 0x01
+FLAG_CLOCK_CHECKED = 0x02  # report only
+FLAG_CLOCK_BAD = 0x04  # report only
 
 _HEADER = struct.Struct("!BBBxIQ")
 _U64 = struct.Struct("!Q")

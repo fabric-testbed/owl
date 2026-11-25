@@ -1,6 +1,6 @@
 # OWL Clock Chain
 
-*Last updated 2026-11-25.* Which clocks a one-way latency number on a FABRIC VM depends on, who keeps each one right, what the two FABRIC test runs (2026-11-24 and 25) showed about them, and what owl2 does about it.
+*Last updated 2026-11-25 (daemon clock check added).* Which clocks a one-way latency number on a FABRIC VM depends on, who keeps each one right, what the two FABRIC test runs (2026-11-24 and 25) showed about them, and what owl2 does about it.
 
 **Contents**
 1. [Why one-way latency needs synchronized clocks](#1-why-one-way-latency-needs-synchronized-clocks)
@@ -146,10 +146,10 @@ The CLEM run is useful as a deliberate-looking failure:
 
 ## 7. What can still go wrong, and what catches it
 
-| Failure | Effect | Caught by the notebook today | Caught by owl2 (planned) |
+| Failure | Effect | Caught by the notebook | Caught by owl daemon |
 |---|---|---|---|
-| `phc2sys@<iface>` not running | hw off by up to ~1 s, drifting | yes (clock check) | yes (`ptp_ok` guard, Phase 2) |
-| `phc2sys@CLOCK_REALTIME` not running | sw off by ms, drifting | yes (each clock is judged against `ptp_kvm`, so a healthy VF clock isn't blamed) | yes, if the guard also compares against `ptp_kvm` |
+| `phc2sys@<iface>` not running | hw off by up to ~1 s, drifting | yes (clock check) | yes: the daemon's clock check |
+| `phc2sys@CLOCK_REALTIME` not running | sw off by ms, drifting | yes (each clock is judged against `ptp_kvm`, so a healthy VF clock isn't blamed) | yes, in sw mode; in hw mode it doesn't matter and isn't flagged |
 | `ptp_kvm` module missing (kernel upgraded without `linux-modules-extra`) | neither service can run | yes | yes |
 | **The host itself loses PTP** (grandmaster outage, host `ptp4l` unlocked) | `ptp_kvm` is wrong, and every clock in the VM agrees with it | **no** | **no**: needs a check from outside the VM (see below) |
 | Route asymmetry | indistinguishable from clock offset in the latency data | not an error, but limits what the apparent offset can prove | — |
@@ -164,8 +164,11 @@ The CLEM run is useful as a deliberate-looking failure:
 
 - **Decided: `--clock hw` is the default and the FABRIC mode.** It needs `phc2sys@<iface>` running in the VM, and its timebase on FABRIC is UTC.
 - **Decided (2026-11-25): `--clock sw` uses `TX_SCHED` on every machine.** It works on every driver, including FABRIC's VFs. Expect sw latencies tens of µs higher and noisier than hw. Use it on hosts without a usable NIC clock.
-- **Decided: owl checks clocks but doesn't manage them.** The Phase 2 `ptp_ok` guard marks samples as untrusted instead of dropping them.
-- **Decided (2026-11-25): judge both VM clocks against `ptp_kvm`** when it exists, rather than against each other, so a broken system clock isn't reported as a broken NIC clock. The notebook's clock check does this now, and the Phase 2 `ptp_ok` guard will do the same.
+- **Built (2026-11-25): owl checks clocks but doesn't manage them.** `owl daemon` measures the clock its timestamps come from (the VF clock in hw mode, the system clock in sw mode) against `ptp_kvm` every 10 s, using the same tightest-of-N method as the notebook. It flags records instead of dropping them.
+  - Because a probe needs *both* clocks right, each daemon also sends its verdict to its peers as two flag bits in every report.
+  - So each probe record carries `local_clock_ok`, `remote_clock_ok` and the combined `ptp_ok`, and summaries count the bad probes in `ptp_bad`.
+  - A daemon can only check its own VM's chain. A host-level PTP failure (the blind spot above) still shows as "ok".
+- **Decided (2026-11-25): judge both VM clocks against `ptp_kvm`** when it exists, rather than against each other, so a broken system clock isn't reported as a broken NIC clock. The notebook's clock check and the daemon's both do this.
 - **Decided: the Phase 3 slice manager verifies every VM itself**: services active and offsets small, and it treats a failing site as down. CLEM shows that the `ptp_capable` flag alone isn't enough.
 - **Open: host-level PTP failures.** Mesh consistency in the dashboard, a coarse NTP check in owl, both, or neither.
 

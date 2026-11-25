@@ -46,6 +46,16 @@ class TestLineProtocol(unittest.TestCase):
         line = to_line_protocol(probe(1, status="send_failed", error='Network "is" unreachable'), "owl")
         self.assertIn(r'error="Network \"is\" unreachable"', line)
 
+    def test_summary_and_booleans(self):
+        rec = {"type": "summary", "time_ns": 60_000_000_000, "window_s": 60.0, "src_label": "STAR",
+               "dst_label": "PSC", "src_ip": "10.0.0.1", "dst_ip": "10.0.0.2", "af": 4, "clock": "hw",
+               "sent": 12, "ok": 12, "owl_min_ns": 5, "ptp_bad": 0, "ptp_ok": True}
+        self.assertEqual(
+            to_line_protocol(rec, "owl_summary"),
+            "owl_summary,af=4,clock=hw,dst_ip=10.0.0.2,dst_label=PSC,src_ip=10.0.0.1,src_label=STAR "
+            "window_s=60.0,sent=12i,ok=12i,owl_min_ns=5i,ptp_bad=0i,ptp_ok=true 60000000000",
+        )
+
     def test_stats(self):
         line = to_line_protocol({"type": "stats", "time_ns": 5, "src_label": "STAR", "uptime_s": 1.5,
                                  "sent": 10, "ok": 9}, "owl_stats")
@@ -56,7 +66,7 @@ class TestValidateSpec(unittest.TestCase):
     def test_defaults(self):
         s = validate_spec({"type": "http-lineprotocol", "url": "http://h:8086/api/v2/write?bucket=b"})
         self.assertEqual((s["batch_size"], s["flush_interval"], s["max_buffer"], s["gzip"]), (5000, 10.0, 100000, True))
-        self.assertEqual(s["records"], ["probe", "stats"])
+        self.assertEqual(s["records"], ["probe", "summary", "stats"])
         self.assertEqual(validate_spec({"type": "jsonl"})["path"], "-")
 
     def test_rejects(self):
@@ -68,7 +78,7 @@ class TestValidateSpec(unittest.TestCase):
             ({"type": "http-lineprotocol", "url": "http://h", "batch_size": 10, "max_buffer": 5}, "exceed"),
             ({"type": "http-lineprotocol", "url": "http://h", "gzip": "yes"}, "gzip"),
             ({"type": "http-lineprotocol", "url": "http://h", "bucket": "x"}, "unknown key(s) bucket"),
-            ({"type": "jsonl", "records": ["summary"]}, "records"),
+            ({"type": "jsonl", "records": ["traces"]}, "records"),
             ({"type": "kafka"}, "type one of"),
         ]:
             with self.subTest(spec=spec), self.assertRaises(ValueError) as cm:

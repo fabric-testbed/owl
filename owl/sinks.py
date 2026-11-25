@@ -11,11 +11,11 @@ Sink config entries (validated by validate_spec):
     {"type": "http-lineprotocol",
      "url": "https://influx.example:8086/api/v2/write?org=ORG&bucket=BUCKET&precision=ns",
      "token_file": "/etc/owl/influx-token",              or "token": "..."; sent as "Authorization: Token ..."
-     "measurement": "owl", "stats_measurement": "owl_stats",
+     "measurement": "owl", "summary_measurement": "owl_summary", "stats_measurement": "owl_stats",
      "batch_size": 5000, "flush_interval": 10, "max_buffer": 100000, "timeout": 10, "gzip": true}
 
-Either kind takes "records": ["probe", "stats"] to choose which record types it gets
-(default: all), e.g. to send probes and stats to different buckets.
+Either kind takes "records": ["probe", "summary", "stats"] to choose which record types
+it gets (default: all), e.g. to send raw probes and summaries to different buckets.
 """
 
 from __future__ import annotations
@@ -30,12 +30,13 @@ import urllib.error
 import urllib.request
 from typing import IO, Any, Callable, Deque, Dict, List, Optional
 
-RECORD_TYPES = ("probe", "stats")
+RECORD_TYPES = ("probe", "summary", "stats")
 
 # Line protocol layout of each record type: which keys become tags. Every other
 # non-None value becomes a field; "type" and "time_ns" are never written as either.
 _TAGS = {
     "probe": ("af", "clock", "dst_ip", "dst_label", "src_ip", "src_label", "status"),  # sorted: faster ingest
+    "summary": ("af", "clock", "dst_ip", "dst_label", "src_ip", "src_label"),
     "stats": ("src_label",),
 }
 
@@ -47,6 +48,7 @@ _SPECS: Dict[str, Dict[str, Any]] = {
         "token": ("str", None),
         "token_file": ("str", None),
         "measurement": ("str", "owl"),
+        "summary_measurement": ("str", "owl_summary"),
         "stats_measurement": ("str", "owl_stats"),
         "batch_size": ("int+", 5000),
         "flush_interval": ("num+", 10.0),
@@ -231,6 +233,7 @@ class HttpLineProtocolSink(Sink):
         *,
         token: Optional[str] = None,
         measurement: str = "owl",
+        summary_measurement: str = "owl_summary",
         stats_measurement: str = "owl_stats",
         batch_size: int = 5000,
         flush_interval: float = 10.0,
@@ -243,7 +246,7 @@ class HttpLineProtocolSink(Sink):
         super().__init__(records)
         self.url = url
         self.token = token
-        self.measurements = {"probe": measurement, "stats": stats_measurement}
+        self.measurements = {"probe": measurement, "summary": summary_measurement, "stats": stats_measurement}
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.max_buffer = max_buffer
@@ -392,7 +395,8 @@ def make_sink(spec: Dict[str, Any], log: Callable[[str], None] = lambda m: print
             raise ValueError(f"token_file {spec['token_file']} is empty")
     return HttpLineProtocolSink(
         spec["url"], token=token, measurement=spec["measurement"],
-        stats_measurement=spec["stats_measurement"], batch_size=spec["batch_size"],
+        summary_measurement=spec["summary_measurement"], stats_measurement=spec["stats_measurement"],
+        batch_size=spec["batch_size"],
         flush_interval=float(spec["flush_interval"]), max_buffer=spec["max_buffer"],
         timeout=float(spec["timeout"]), gzip=spec["gzip"], records=spec["records"], log=log,
     )

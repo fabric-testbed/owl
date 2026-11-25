@@ -99,6 +99,25 @@ def enable_hw_timestamping(iface: str) -> int:
     return cfg[2]
 
 
+# linux/ethtool.h: struct ethtool_ts_info, which `ethtool -T` prints
+SIOCETHTOOL = 0x8946
+ETHTOOL_GET_TS_INFO = 0x41
+_TS_INFO_WORDS = 11  # cmd, so_timestamping, phc_index, tx_types, tx_reserved[3], rx_filters, rx_reserved[3]
+
+
+def phc_index(iface: str) -> Optional[int]:
+    """Return N for the NIC's PTP hardware clock /dev/ptpN, or None if it has none."""
+    name = iface.encode()
+    if len(name) >= 16:
+        raise ValueError(f"interface name too long: {iface!r}")
+    info = array.array("i", [ETHTOOL_GET_TS_INFO] + [0] * (_TS_INFO_WORDS - 1))
+    addr, _ = info.buffer_info()
+    ifr = struct.pack("16sP", name, addr).ljust(_IFREQ_SIZE, b"\0")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        fcntl.ioctl(s.fileno(), SIOCETHTOOL, ifr)
+    return info[2] if info[2] >= 0 else None
+
+
 # --- Address and interface lookup --------------------------------------------------
 
 

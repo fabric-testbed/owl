@@ -10,8 +10,9 @@ FABRIC-specific code. It uses only the Python standard library, so there is
 nothing to install besides Python 3.9+.
 
 > **Status:** owl2 rewrite in progress (branch `owl2`). `owl ping`,
-> `owl reflect` and `owl daemon` (JSON Lines and InfluxDB output) work.
-> Per-peer summaries and a clock-health flag are next. v1 (Docker + tcpdump +
+> `owl reflect` and `owl daemon` (JSON Lines and InfluxDB output, per-peer
+> summaries, clock-health check) work. A systemd unit and a single-file build
+> are next. v1 (Docker + tcpdump +
 > PCAP) is preserved at tag `v1-final`.
 
 ## Requirements
@@ -120,9 +121,31 @@ straight from the config, so you can use site names, hostnames, or anything else
 {"type":"probe","time_ns":1795644249182783846,"src_label":"STAR","dst_label":"PSC","src_ip":"10.129.138.2","dst_ip":"10.140.135.2","af":4,"clock":"hw","seq":42,"status":"ok","owl_ns":24408113,"rtt_ns":48903220,"tx_ns":1795644249182790000,"rx_ns":1795644249207198113}
 ```
 
-Every `stats_interval` seconds it also writes a `"type":"stats"` record with
-cumulative counters (probes sent, each status, reflected, sink drops) and logs the
-same counters to stderr, which systemd sends to the journal. SIGTERM stops it cleanly.
+Every `summary_interval` seconds (default 60, aligned to the wall clock, so whole
+minutes) it writes one `"type":"summary"` record per peer with `sent`, `ok`, `lost`,
+`invalid`, `owl_{min,p50,mean,max,stddev}_ns`, `rtt_{min,p50}_ns`, and `ptp_bad`/`ptp_ok`.
+
+Every `stats_interval` seconds it writes a `"type":"stats"` record with cumulative
+counters (probes sent, each status, reflected, summaries, sink drops, clock state) and
+logs the same counters to stderr, which systemd sends to the journal. SIGTERM stops it
+cleanly, writing the last partial summaries and final stats.
+
+**Clock check.** A latency is only as good as the clocks at both ends, so every
+`clock_check_interval` seconds the daemon measures the clock its timestamps come from
+against a reference:
+- **reference:** `/dev/ptp_kvm` on a VM. Otherwise the system clock, for `--clock hw` only.
+- **clock checked:** the NIC's hardware clock in hw mode, the system clock in sw mode.
+
+A clock more than `clock_max_offset_us` from the reference is reported as not
+synchronized; an offset of about 37 s counts as healthy, since a NIC clock may run on TAI.
+The verdict is logged when it changes. It is also sent to every peer as two flag bits in
+the daemon's reports, so each probe record carries both ends' state:
+- `local_clock_ok`: this daemon's clock;
+- `remote_clock_ok`: the reflecting peer's clock, if the peer checks its clock;
+- `ptp_ok`: false if either end is bad, true if both are known good.
+
+Bad-clock probes are flagged, not dropped. [docs/clock-chain.md](docs/clock-chain.md)
+explains why these clocks matter and what this check can't see.
 
 Config keys (only `label` and `peers` are required):
 
@@ -138,6 +161,10 @@ Config keys (only `label` and `peers` are required):
 | `ifaces` | found from the routes to the peers | interfaces to enable hardware timestamping on |
 | `listen` | all IPv4 and IPv6 addresses | addresses to listen on |
 | `stats_interval` | 60 | seconds between stats records and log lines |
+| `summary_interval` | 60 | seconds per summary window |
+| `clock_check` | true | check the timestamp clock's synchronization |
+| `clock_check_interval` | 10 | seconds between clock checks |
+| `clock_max_offset_us` | 10 | largest offset from the reference still counted as synchronized |
 | `sinks` | `[{"type": "jsonl", "path": "-"}]` | where records go (see below) |
 
 Unknown keys are rejected, so a typo fails `--check` instead of being silently ignored.
@@ -162,6 +189,7 @@ accepts line protocol over HTTP:
 | `url` | — | write endpoint, including org/bucket query parameters for InfluxDB v2 |
 | `token` / `token_file` | none | sent as `Authorization: Token …`; prefer a file readable only by root |
 | `measurement` | `owl` | measurement for probe records |
+| `summary_measurement` | `owl_summary` | measurement for summary records |
 | `stats_measurement` | `owl_stats` | measurement for stats records |
 | `batch_size` | 5000 | most lines per POST |
 | `flush_interval` | 10 | seconds between POSTs when no full batch is waiting |
@@ -169,12 +197,14 @@ accepts line protocol over HTTP:
 | `timeout` | 10 | seconds per HTTP request |
 | `gzip` | true | compress request bodies |
 
-Any sink also takes `"records": ["probe"]` or `["stats"]` to receive only one kind,
-for example to send stats to a different bucket.
+Any sink also takes `"records"`, a list drawn from `"probe"`, `"summary"` and `"stats"`,
+to receive only those kinds. For example, raw probes can go to a short-retention
+bucket and summaries to a long-retention one.
 
 Probe records are written as measurement `owl` with tags `src_label`, `dst_label`,
-`src_ip`, `dst_ip`, `af`, `clock` and `status`, and integer fields `seq`, `owl_ns`,
-`rtt_ns`, `tx_ns` and `rx_ns`. A lost probe is still written, but with no `owl_ns`
+`src_ip`, `dst_ip`, `af`, `clock` and `status`; integer fields `seq`, `owl_ns`,
+`rtt_ns`, `tx_ns` and `rx_ns`; and boolean fields `local_clock_ok`,
+`remote_clock_ok` and `ptp_ok` when known. Summaries use the same tags minus `status`. A lost probe is still written, but with no `owl_ns`
 or `rtt_ns`, so loss can be counted from the `status` tag.
 
 Sending happens on a background thread, so a slow or unreachable endpoint never

@@ -6,9 +6,15 @@ One process, one thread, one selector loop:
   probes from other daemons and from `owl ping`;
 - one ProbeEngine per address family sends probes from an ephemeral port and
   turns each into a Result;
-- every Result becomes a "probe" record for the sinks, and every
-  ``stats_interval`` seconds a "stats" record with the counters is emitted and
-  logged to stderr (journald under systemd).
+- every Result becomes a "probe" record for the sinks;
+- every ``summary_interval`` seconds (aligned to the wall clock, so 60 means
+  whole minutes) each peer gets a "summary" record;
+- every ``stats_interval`` seconds a "stats" record with the counters is
+  emitted and logged to stderr (journald under systemd);
+- every ``clock_check_interval`` seconds the clock check (clockcheck.py)
+  measures our timestamp clock against its reference. The verdict goes into
+  every record and, as report flags, to every peer that probes us, so each
+  probe record knows the state of both clocks behind it.
 
 Peers are probed ``interval`` seconds apart, staggered evenly across the
 interval so a large mesh doesn't send in bursts. Labels are free-form strings
@@ -22,6 +28,8 @@ Config (JSON; only "label" and "peers" are required):
       "peers": [{"addr": "10.140.135.2", "label": "PSC"}, {"addr": "2602:fcfb:1::2", "label": "PSC"}],
       "clock": "hw", "port": 49005, "interval": 5.0, "timeout": 2.0, "size": 16,
       "ifaces": ["ens7"], "listen": ["0.0.0.0", "::"], "stats_interval": 60.0,
+      "summary_interval": 60.0, "clock_check": true, "clock_check_interval": 10.0,
+      "clock_max_offset_us": 10.0,
       "sinks": [{"type": "jsonl", "path": "-"}]
     }
 
@@ -29,24 +37,41 @@ Probe record fields:
 
     type="probe", time_ns (wall clock when sent), src_label, dst_label, src_ip,
     dst_ip, af (4 or 6), clock ("hw"/"sw"), seq, status, owl_ns, rtt_ns, tx_ns,
-    rx_ns, and error (only for send_failed)
+    rx_ns, error (only for send_failed), and when known: local_clock_ok,
+    remote_clock_ok (from the peer's report), ptp_ok (false if either clock is
+    bad, true if both are known good)
+
+Summary record fields (one per peer per window with at least one probe):
+
+    type="summary", time_ns (window start), window_s, the probe record's
+    src/dst/af/clock fields, sent, ok, lost (incl. send_failed), invalid
+    (no_tx_ts + no_rx_ts), owl_{min,p50,mean,max,stddev}_ns and
+    rtt_{min,p50}_ns over the ok probes, ptp_bad (probes with ptp_ok false),
+    and ptp_ok (no bad probes; only when any probe's clock state was known)
 """
 
 from __future__ import annotations
 
 import json
 import selectors
+import statistics
 import socket
 import sys
 import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import packets
+from .clockcheck import ClockGuard
 from .ping import (
     DEFAULT_PORT,
+    LOST,
+    NO_RX_TS,
+    NO_TX_TS,
+    OK,
+    SEND_FAILED,
     STATUSES,
     ProbeEngine,
     Result,
@@ -87,11 +112,16 @@ class Config:
     ifaces: Optional[List[str]] = None
     listen: Optional[List[str]] = None
     stats_interval: float = 60.0
+    summary_interval: float = 60.0
+    clock_check: bool = True
+    clock_check_interval: float = 10.0
+    clock_max_offset_us: float = 10.0
     sinks: List[Dict[str, Any]] = field(default_factory=lambda: [{"type": "jsonl", "path": "-"}])
 
 
 _TOP_KEYS = {"label", "peers", "clock", "port", "interval", "timeout", "size", "ifaces", "listen",
-             "stats_interval", "sinks"}
+             "stats_interval", "summary_interval", "clock_check", "clock_check_interval",
+             "clock_max_offset_us", "sinks"}
 _PEER_KEYS = {"addr", "label"}
 
 
@@ -155,9 +185,14 @@ def parse_config(obj: Any) -> Config:
         cfg.clock = obj["clock"]
     if "port" in obj:
         cfg.port = _number(obj["port"], "port", integer=True, low=1, low_ok=True, high=65535)
-    for key in ("interval", "timeout", "stats_interval"):
+    for key in ("interval", "timeout", "stats_interval", "summary_interval", "clock_check_interval",
+                "clock_max_offset_us"):
         if key in obj:
             setattr(cfg, key, float(_number(obj[key], key)))
+    if "clock_check" in obj:
+        if not isinstance(obj["clock_check"], bool):
+            raise ConfigError("clock_check must be true or false")
+        cfg.clock_check = obj["clock_check"]
     if "size" in obj:
         cfg.size = _number(obj["size"], "size", integer=True, low=packets.HEADER_LEN, low_ok=True,
                            high=packets.MAX_PROBE_LEN)
@@ -190,6 +225,48 @@ def load_config(path: str) -> Config:
 
 
 # --- Daemon --------------------------------------------------------------------------------
+
+
+class _Window:
+    """One peer's results within one summary window."""
+
+    __slots__ = ("statuses", "owl", "rtt", "ptp_known", "ptp_bad")
+
+    def __init__(self) -> None:
+        self.statuses: Counter = Counter()
+        self.owl: List[int] = []
+        self.rtt: List[int] = []
+        self.ptp_known = 0
+        self.ptp_bad = 0
+
+    def add(self, r: Result, ptp_ok: Optional[bool]) -> None:
+        self.statuses[r.status] += 1
+        if r.status == OK:
+            self.owl.append(r.owl_ns)
+            if r.rtt_ns is not None:
+                self.rtt.append(r.rtt_ns)
+        if ptp_ok is not None:
+            self.ptp_known += 1
+            self.ptp_bad += not ptp_ok
+
+    def fields(self) -> Dict[str, Any]:
+        c = self.statuses
+        out: Dict[str, Any] = {
+            "sent": sum(c.values()),
+            "ok": c[OK],
+            "lost": c[LOST] + c[SEND_FAILED],
+            "invalid": c[NO_TX_TS] + c[NO_RX_TS],
+        }
+        if self.owl:
+            out.update(owl_min_ns=min(self.owl), owl_p50_ns=round(statistics.median(self.owl)),
+                       owl_mean_ns=round(statistics.fmean(self.owl)), owl_max_ns=max(self.owl),
+                       owl_stddev_ns=round(statistics.pstdev(self.owl)))
+        if self.rtt:
+            out.update(rtt_min_ns=min(self.rtt), rtt_p50_ns=round(statistics.median(self.rtt)))
+        out["ptp_bad"] = self.ptp_bad
+        if self.ptp_known:
+            out["ptp_ok"] = self.ptp_bad == 0
+        return out
 
 
 class _Peer:
@@ -234,7 +311,13 @@ class Daemon:
         self.reflector = open_reflector(binds, self.ifaces, defaulted=not cfg.listen)
 
         self.engines: Dict[int, ProbeEngine] = {}
+        self.guard: Optional[ClockGuard] = None
+        self._windows: Dict[Tuple[_Peer, int], _Window] = {}
+        self._window_ns = int(cfg.summary_interval * 1e9)
         try:
+            if cfg.clock_check:
+                self.guard = ClockGuard(self.hw, self.ifaces, max_offset_ns=int(cfg.clock_max_offset_us * 1000),
+                                        log=log)
             for family in sorted({p.family for p in self.peers}):
                 wildcard = ("0.0.0.0", 0) if family == socket.AF_INET else ("::", 0, 0, 0)
                 sock = TimestampedSocket(family, wildcard, tx_timestamps=True, hw=self.hw)
@@ -277,6 +360,20 @@ class Daemon:
 
     def _emit_result(self, peer: _Peer, r: Result) -> None:
         self.counters[r.status] += 1
+        local = self.guard.ok if self.guard else None
+        remote = r.remote_clock_ok
+        if local is False or remote is False:
+            ptp_ok: Optional[bool] = False
+        elif local and remote:
+            ptp_ok = True
+        else:
+            ptp_ok = None
+        start = r.sent_unix_ns - r.sent_unix_ns % self._window_ns
+        win = self._windows.get((peer, start))
+        if win is None:
+            win = self._windows[(peer, start)] = _Window()
+        win.add(r, ptp_ok)
+
         record = {
             "type": "probe",
             "time_ns": r.sent_unix_ns,
@@ -295,7 +392,40 @@ class Daemon:
         }
         if r.error:
             record["error"] = r.error
+        for key, value in (("local_clock_ok", local), ("remote_clock_ok", remote), ("ptp_ok", ptp_ok)):
+            if value is not None:
+                record[key] = value
         self._emit(record)
+
+    def _peer_fields(self, peer: _Peer) -> Dict[str, Any]:
+        return {
+            "src_label": self.cfg.label,
+            "dst_label": peer.label,
+            "src_ip": peer.src_ip,
+            "dst_ip": peer.sockaddr[0],
+            "af": 6 if peer.family == socket.AF_INET6 else 4,
+            "clock": self.cfg.clock,
+        }
+
+    def emit_summaries(self, final: bool = False) -> None:
+        """Emit every window that can no longer receive results (all of them if ``final``)."""
+        # A probe's result arrives at most `timeout` after it was sent; allow 1 s more.
+        cutoff = time.time_ns() - self._window_ns - int((self.cfg.timeout + 1.0) * 1e9)
+        for (peer, start) in sorted((k for k in self._windows if final or k[1] <= cutoff), key=lambda k: k[1]):
+            win = self._windows.pop((peer, start))
+            self._emit({"type": "summary", "time_ns": start, "window_s": self.cfg.summary_interval,
+                        **self._peer_fields(peer), **win.fields()})
+            self.counters["summaries"] += 1
+
+    def check_clock(self) -> None:
+        """Run the clock check and tell peers the result through our reports."""
+        if not self.guard:
+            return
+        ok = self.guard.check()
+        if ok is None:
+            self.reflector.clock_flags = 0
+        else:
+            self.reflector.clock_flags = packets.FLAG_CLOCK_CHECKED | (0 if ok else packets.FLAG_CLOCK_BAD)
 
     def stats(self) -> Dict[str, Any]:
         """Cumulative counters since start."""
@@ -310,8 +440,19 @@ class Daemon:
             "pending": sum(e.pending for e in self.engines.values()),
             "reflected": self.reflector.probes,
             "reflect_errors": self.reflector.errors,
+            "summaries": c["summaries"],
+            **self._clock_stats(),
             **self._sink_stats(),
         }
+
+    def _clock_stats(self) -> Dict[str, Any]:
+        if not self.guard or self.guard.ok is None:
+            return {}
+        out: Dict[str, Any] = {"clock_ok": self.guard.ok}
+        worst = self.guard.worst_offset_ns()
+        if worst is not None:
+            out["clock_offset_ns"] = worst
+        return out
 
     def _sink_stats(self) -> Dict[str, int]:
         totals: Counter = Counter()
@@ -331,8 +472,9 @@ class Daemon:
     def describe(self) -> str:
         where = ", ".join(f"[{s.sockname[0]}]:{s.sockname[1]}" for s in self.reflector.socks)
         hw = f"clock hw on {', '.join(self.ifaces)}" if self.hw else "clock sw"
+        check = self.guard.describe() if self.guard else "clock check off (config)"
         return (f"label {self.cfg.label}, {len(self.peers)} peers every {self.cfg.interval:g} s, {hw}, "
-                f"listening on {where}, sinks: {', '.join(s.describe() for s in self.sinks)}")
+                f"listening on {where}, {check}, sinks: {', '.join(s.describe() for s in self.sinks)}")
 
     # -- loop --
 
@@ -348,10 +490,13 @@ class Daemon:
         # The first socket on a host to request software RX timestamps makes the kernel turn them
         # on through deferred work (net_enable_timestamp), so packets in the next few ms can arrive
         # unstamped; probing ourselves right away gave an occasional no_rx_ts on seq 0. Wait briefly.
+        self.check_clock()  # know our clock's state before the first probe or report
         start = time.monotonic() + STARTUP_DELAY
         for i, p in enumerate(self.peers):
             p.next_send = start + i * cfg.interval / len(self.peers)
         next_stats = start + cfg.stats_interval
+        next_clock = time.monotonic() + cfg.clock_check_interval
+        next_summary = time.monotonic() + 1.0
         try:
             while stop is None or not stop.is_set():
                 now = time.monotonic()
@@ -369,13 +514,19 @@ class Daemon:
                     for peer, r in engine.expire(now):
                         self._emit_result(peer, r)
 
+                if now >= next_clock:
+                    self.check_clock()
+                    next_clock = now + cfg.clock_check_interval
+                if now >= next_summary:
+                    self.emit_summaries()
+                    next_summary = now + 1.0
                 if now >= next_stats:
                     self.log_stats()
                     next_stats += cfg.stats_interval
                     if next_stats <= now:
                         next_stats = now + cfg.stats_interval
 
-                wake = [next_stats] + [p.next_send for p in self.peers]
+                wake = [next_stats, next_clock, next_summary] + [p.next_send for p in self.peers]
                 wake += [d for d in (e.next_deadline() for e in self.engines.values()) if d is not None]
                 timeout = min(max(0.0, min(wake) - time.monotonic()), 0.5)  # 0.5 s: notice `stop`
                 for key, _ in sel.select(timeout):
@@ -390,6 +541,8 @@ class Daemon:
     def close(self) -> None:
         for engine in getattr(self, "engines", {}).values():
             engine.sock.close()
+        if getattr(self, "guard", None) is not None:
+            self.guard.close()
         if getattr(self, "reflector", None) is not None:
             self.reflector.close()
         for s in self.sinks:
