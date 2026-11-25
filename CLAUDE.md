@@ -39,6 +39,7 @@ owl/
 ├── cli.py       # argparse: `owl ping`, `owl reflect`
 └── __main__.py  # python -m owl
 tests/           # unittest: test_packets.py (portable), test_loopback.py (Linux)
+docs/            # clock-chain.md: which clocks a measurement depends on (FABRIC host/ptp_kvm/VF PHC), failure modes, test results; keep it current when clock handling changes
 dev/             # FABRIC validation notebooks (not part of the package), e.g. the two-node hw test
 ```
 

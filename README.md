@@ -103,13 +103,18 @@ answers with "no timestamp" rather than substituting a software time.
 | | `--clock hw` | `--clock sw` |
 |---|---|---|
 | Where the time is taken | in the NIC as the packet crosses the wire | in the kernel: TX as the packet is queued to the device, RX as it enters the stack |
-| Clock | the NIC's PTP hardware clock (often TAI) | `CLOCK_REALTIME` (UTC) |
-| Typical accuracy | tens of ns | a few µs |
+| Clock | the NIC's PTP hardware clock (often TAI; UTC on FABRIC) | `CLOCK_REALTIME` (UTC) |
+| Distance from the wire | nanoseconds | µs to tens of µs (more in VMs), so latencies read slightly high |
 | Needs | NIC support + root/`CAP_NET_ADMIN` | nothing |
 
 Both ends must use the same kind, and owl enforces this. Neither kind depends
 on Python's speed: the timestamps are recorded by the kernel or NIC, and owl
-only reads them afterwards.
+only reads them afterwards. In both modes the result is only as good as the
+synchronization between the two machines' clocks, which owl does not manage.
+
+[docs/clock-chain.md](docs/clock-chain.md) explains which clocks a measurement
+depends on, especially on FABRIC VMs, where the NIC's clock must be steered
+inside the VM. It also covers what can go wrong and what has been measured.
 
 `--clock hw` changes a NIC-wide setting: it turns on TX timestamps and sets the
 RX filter to "all packets" (`SIOCSHWTSTAMP`, the same thing
